@@ -41,3 +41,8 @@ add_executable(kokoro-adain-snake-1d-test
         kokoro_adain_snake_1d.cpp
 )
 target_link_libraries(kokoro-adain-snake-1d-test tts)
+
+add_executable(kokoro-lstm-scan-test
+        kokoro_lstm_scan.cpp
+)
+target_link_libraries(kokoro-lstm-scan-test tts)

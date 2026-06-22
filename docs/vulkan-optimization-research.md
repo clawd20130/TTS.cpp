@@ -31,6 +31,11 @@ the current source-run CLI measurement on an 82-token Japanese phoneme sample is
 | Vulkan default | `101.756 ms` | `1070.14 ms` | `~2.1s` | `6.000s` |
 | Vulkan + `KOKORO_FUSE_ADAIN_SNAKE=1` | `101.910 ms` | `940.287 ms` | `~2.0s` | `6.000s` |
 
+Through the persistent Tailnet debug frontend, the current SBV2 phoneme ->
+TTS.cpp Vulkan path measures about `1.09s` to `1.15s` for `5.775s` of audio
+(`0.19 RTF`) on the short Japanese benchmark. This proves the route is now
+usable for listening tests, but it is still short of the `0.10 RTF` target.
+
 The important finding is no longer simply that Vulkan is slower than CPU. The
 generator memory-layout bottleneck was real and has been mostly removed; the
 remaining work is now in matrix kernels and many small recurrent/elementwise
@@ -258,8 +263,47 @@ after remap:
 ```
 
 This changes the remaining optimization problem. The biggest generator bottleneck
-is no longer materializing im2col; it is the subsequent matrix products and the
-large number of small recurrent/elementwise dispatches.
+is no longer the materialized im2col write itself. A fresh
+`GGML_VULKAN_PERF=ON` diagnostic run with `GGML_VK_SUBMIT_COUNT=1` on the
+current branch shows the default path dominated by:
+
+```text
+generate diagnostic, default path:
+  CONT:             143 x 2.748 ms = 392.964 ms
+  ADD:             4174 x 0.076 ms = 317.224 ms
+  MUL_MAT buckets:                 = 284.800 ms
+  MUL:             2029 x 0.079 ms = 160.291 ms
+  CONV_TRANSPOSE_1D:  5 x 21.999 ms = 109.995 ms
+  SIGMOID/TANH:                    = 171.859 ms
+  IM2COL:            78 x 0.924 ms =  72.072 ms
+```
+
+The largest matmul buckets are the generator Conv1D-backed shapes:
+
+```text
+MUL_MAT m=27721 n=128 k=1408: 12 x 5.861 ms
+MUL_MAT m=4620  n=256 k=1792: 12 x 4.712 ms
+MUL_MAT m=4620  n=256 k=2816:  6 x 5.143 ms
+MUL_MAT m=27721 n=128 k=896:   6 x 3.848 ms
+```
+
+`KOKORO_FUSE_ADAIN_SNAKE=1` reduces generate nodes from `16704` to `16224` and
+profiling `compute_submit_ms` from `1803.65` to `1642.78`, but its fused op is
+not byte-identical to the default path. Keep it opt-in for now; do not make it
+the default accuracy path.
+
+The `CONT` shape histogram points at repeated large layout materializations:
+
+```text
+CONT out=[128,27721,1,1]: 25
+CONT out=[256,4620,1,1]: 25
+CONT out=[27721,128,1,1]: 25
+CONT out=[4620,256,1,1]: 25
+```
+
+That makes exact layout-copy optimization the next low-risk target: improve the
+generic or specialized Vulkan `CONT`/copy path for these stable transpose/cont
+patterns before attempting a numerically different fused generator block.
 
 ## Source-Level Layout Map
 
@@ -582,17 +626,23 @@ cleanup.
 
 The deeper LSTM scan rewrite collapses thousands of recurrent subgraph nodes
 into one backend op, but it is not currently accuracy-safe on Vulkan. Local
-measurements with `KOKORO_FUSE_LSTM_SCAN=1` produced roughly `28.4 dB` PCM SNR
+measurements with `KOKORO_FUSE_LSTM_SCAN=1` produced roughly `27.7 dB` PCM SNR
 against the default path on an 82-token Japanese phoneme sample, so it must not
 be enabled as an optimization until parity is fixed. It also did not beat the
 default gate-fused graph after the IM2COL remap, because its shader computes the
 recurrent matmul serially inside one workgroup instead of using the optimized
 matrix kernels.
 
+`kokoro-lstm-scan-test` now shows that the scan op is not obviously mis-indexed:
+CPU expanded vs CPU scan, CPU scan vs Vulkan scan, and Vulkan expanded vs
+Vulkan scan all pass on single-layer shapes up to `hidden=256, seq=231`. The
+remaining issue is full-graph waveform equivalence and performance, not basic
+single-op parity.
+
 Keep `KOKORO_FUSE_LSTM_SCAN=1` as an opt-in diagnostic path only. Revisit it
 after generator work. Potential later work:
 
-- fix CPU/Vulkan scan parity against the expanded ggml LSTM body;
+- investigate full-graph amplification of scan floating-point differences;
 - improve recurrent matmul tiling;
 - pack input/recurrent gate weights for Vulkan;
 - use one dispatch per direction/layer;

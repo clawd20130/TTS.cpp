@@ -6,8 +6,8 @@ running TTS GGML graphs directly through ggml backends.
 
 ## Current Baseline
 
-- TTS.cpp currently vendors a patched ggml submodule at
-  `70ba16054447fb613d7c4fba76eeaf9ec0bfbeab`.
+- This branch currently vendors a patched ggml submodule at
+  `5302dc87afb20ac7ff24a4f661d89cf689884901`.
 - Upstream ggml was checked at `707321c4` (`v0.15.2`) for backend coverage.
 - TTS.cpp can be configured with `-DGGML_VULKAN=ON` and the `tts-cli` target
   links against `libvulkan.so.1`.
@@ -52,6 +52,14 @@ the ConvTranspose range fix, IM2COL remap, and default LSTM gate fusion:
 | CPU | `66.600 ms` | `3212.53 ms` | `4614.65 ms` | `6.000s` |
 | Vulkan default | `101.756 ms` | `1070.14 ms` | `~2.1s` | `6.000s` |
 | Vulkan + `KOKORO_FUSE_ADAIN_SNAKE=1` | `101.910 ms` | `940.287 ms` | `~2.0s` | `6.000s` |
+
+Current debug-frontend measurement through the SBV2-to-TTS.cpp proxy on the
+Tailnet frontend (`http://100.109.192.23:8766/debug`) is now much closer to the
+target than the old pre-fix number:
+
+| Path | Synthesis | Audio length | RTF | Clip ratio |
+| --- | ---: | ---: | ---: | ---: |
+| TTS.cpp Vulkan / `jf_alpha` | `1.09s` to `1.15s` | `5.775s` | `0.189` to `0.199` | `0.0` |
 
 The target remains `0.100 RTF` or lower, so this is not done, but the bottleneck
 has moved. The old generate graph had about `17916` nodes and spent almost all
@@ -138,18 +146,23 @@ That reduces the short-sentence LSTM node contribution from `4071` nodes per
 bidirectional LSTM. The rewrite remains opt-in because the Vulkan scan path has
 not passed the waveform parity gate.
 
-The Vulkan `KOKORO_LSTM_SCAN` shader is now wired into the backend, but
-current profiling shows two constraints. First, it is not accuracy-safe: on an
-82-token Japanese phoneme sample, `KOKORO_FUSE_LSTM_SCAN=1` produced the same
-sample count as default but only about `28.4 dB` SNR against the default PCM,
-with max absolute sample difference near `0.049`. Second, even if the parity
-bug is fixed, the current scan shader is not the right performance boundary
-after the IM2COL remap: it computes recurrent matmul serially inside one
-workgroup instead of using the optimized matrix kernels. With fused scan
-enabled, the duration graph is about `600` nodes but spends roughly `141ms` in
-Vulkan compute, while the default gate-fused graph spends roughly `102ms`.
-Therefore this path must stay experimental until parity and performance are both
-fixed. Before the IM2COL remap, `KOKORO_DEBUG_GRAPH_OPS=1` showed the remaining
+The Vulkan `KOKORO_LSTM_SCAN` shader is now wired into the backend, but current
+profiling shows two constraints. First, it is not waveform-equivalent enough:
+on the current Japanese benchmark, `KOKORO_FUSE_LSTM_SCAN=1` produced the same
+sample count as default but only about `27.7 dB` SNR against the default PCM,
+with max absolute sample difference near `0.0565`. New `kokoro-lstm-scan-test`
+coverage shows that CPU expanded vs CPU scan, CPU scan vs Vulkan scan, and
+Vulkan expanded vs Vulkan scan pass on realistic single-layer shapes including
+`hidden=256, seq=78` and `hidden=256, seq=231`. That narrows the issue to small
+per-layer floating-point differences being amplified by the full Kokoro graph,
+not an obvious indexing bug in the scan op. Second, the current scan shader is
+not the right performance boundary after the IM2COL remap: it computes
+recurrent matmul serially inside one workgroup instead of using the optimized
+matrix kernels. With fused scan enabled, the full CLI path was slightly slower
+than default on the benchmark sample. Therefore this path must stay
+experimental until waveform parity and performance are both fixed.
+
+Before the IM2COL remap, `KOKORO_DEBUG_GRAPH_OPS=1` showed the remaining
 generate graph was dominated by generator Conv1D lowering:
 
 ```text
