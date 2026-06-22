@@ -22,6 +22,11 @@ add_executable(vulkan-im2col-test
 )
 target_link_libraries(vulkan-im2col-test tts)
 
+add_executable(vulkan-transpose-cont-2d-test
+        vulkan_transpose_cont_2d.cpp
+)
+target_link_libraries(vulkan-transpose-cont-2d-test tts)
+
 add_executable(kokoro-conv-1d-test
         kokoro_conv_1d.cpp
 )

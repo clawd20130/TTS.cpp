@@ -617,6 +617,37 @@ After Conv1D blocks are improved, revisit:
 - harmonic source / STFT / iSTFT memory traffic;
 - whether any post-generator op forces a layout bounce.
 
+### Phase 4a: specialize layout copies without changing math
+
+The default Kokoro generator repeatedly materializes
+`ggml_cont(ggml_transpose(x))` around channel/time layout changes. The generic
+Vulkan copy shader handles these with per-element 4D index arithmetic and
+strided stores/loads. A targeted `transpose_cont_2d_f32` shader now covers only
+strict F32 2D transpose views copied to contiguous F32 destinations. All other
+`CONT`, `CPY`, and `DUP` cases still use the original generic path.
+
+Validation:
+
+```text
+vulkan-transpose-cont-2d-test
+vulkan-im2col-test
+kokoro-adain-snake-1d-test
+kokoro-lstm-scan-test
+```
+
+Same-binary A/B on the 82-token Japanese IPA sample:
+
+```text
+default enabled:  generate compute_submit_ms=684.516, total_ms=813.588
+disabled by GGML_VK_DISABLE_TRANSPOSE_CONT_2D=1:
+                  generate compute_submit_ms=1018.27, total_ms=1145.2
+```
+
+Both WAV outputs had identical PCM (`max_abs=0`, `rmse=0`, infinite SNR), so the
+optimization is accuracy-safe for this measured path. The Tailnet debug
+frontend path improved to median `0.738s` synthesis for `5.775s` audio
+(`0.128 RTF`, no clipping) on the Japanese sentence benchmark.
+
 ### Phase 5: fix or retire LSTM scan after generator work
 
 The LSTM gate-concat rewrite is enabled by default and can be disabled with

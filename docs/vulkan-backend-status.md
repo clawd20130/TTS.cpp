@@ -7,7 +7,7 @@ running TTS GGML graphs directly through ggml backends.
 ## Current Baseline
 
 - This branch currently vendors a patched ggml submodule at
-  `5302dc87afb20ac7ff24a4f661d89cf689884901`.
+  `05d4a5e4d2d4a6b9674974156fe9208b45448e82`.
 - Upstream ggml was checked at `707321c4` (`v0.15.2`) for backend coverage.
 - TTS.cpp can be configured with `-DGGML_VULKAN=ON` and the `tts-cli` target
   links against `libvulkan.so.1`.
@@ -60,6 +60,13 @@ target than the old pre-fix number:
 | Path | Synthesis | Audio length | RTF | Clip ratio |
 | --- | ---: | ---: | ---: | ---: |
 | TTS.cpp Vulkan / `jf_alpha` | `1.09s` to `1.15s` | `5.775s` | `0.189` to `0.199` | `0.0` |
+
+After the 2D `transpose -> cont` Vulkan copy specialization, the same debug
+frontend path measured:
+
+| Path | Synthesis | Audio length | RTF | Clip ratio |
+| --- | ---: | ---: | ---: | ---: |
+| TTS.cpp Vulkan / `jf_alpha` | `0.735s` to `0.799s`, median `0.738s` | `5.775s` | median `0.128` | `0.0` |
 
 The target remains `0.100 RTF` or lower, so this is not done, but the bottleneck
 has moved. The old generate graph had about `17916` nodes and spent almost all
@@ -237,6 +244,23 @@ CONV_TRANSPOSE_1D: 5 x 23.747 ms
 
 The remaining generator bottleneck has shifted from im2col materialization to
 the following `MUL_MAT` kernels and the many small LSTM/elementwise dispatches.
+
+The generator also spends meaningful time in `CONT` nodes created by
+`ggml_cont(ggml_transpose(x))`. A Vulkan-only `transpose_cont_2d_f32` fast path
+now handles strict F32 2D transpose views into contiguous F32 destinations and
+falls back to the generic copy kernel otherwise. It can be disabled with
+`GGML_VK_DISABLE_TRANSPOSE_CONT_2D=1` for A/B checks. On the 82-token Japanese
+IPA CLI sample with deterministic UV noise:
+
+```text
+enabled:  generate compute_submit_ms=684.516, output_samples=141000
+disabled: generate compute_submit_ms=1018.27, output_samples=141000
+```
+
+The enabled and disabled WAVs were byte-identical (`max_abs=0`, `rmse=0`,
+matching `peak=12329`, no clipping). `vulkan-transpose-cont-2d-test` covers CPU
+vs Vulkan parity for odd tile sizes and Kokoro hotspot shapes such as
+`[256,4620] -> [4620,256]` and `[128,27721] -> [27721,128]`.
 
 An additional opt-in rewrite exists behind `KOKORO_FUSE_CONV1D=1`. It adds a
 `KOKORO_CONV_1D` op with CPU reference and Vulkan implementations and replaces
