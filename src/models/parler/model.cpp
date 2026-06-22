@@ -112,9 +112,17 @@ void parler_tts_model::prep_cross_key_values(int n_threads, struct tts_response 
     ggml_backend_buffer_type_t backend_cpu_buffer = ggml_backend_cpu_buffer_type();
     // Let it create a disposable threadpool just this once
     ggml_backend_cpu_set_n_threads(backend_cpu, n_threads);
-    std::vector<ggml_backend_buffer_type_t> bufs = {backend_cpu_buffer};
-    std::vector<ggml_backend_t> backs = {backend_cpu};
-    ggml_backend_sched_t sched = ggml_backend_sched_new(backs.data(), bufs.data(), 1, max_cross_nodes*n_layers, false);
+    std::vector<ggml_backend_buffer_type_t> bufs;
+    std::vector<ggml_backend_t> backs;
+    ggml_backend_dev_t model_dev = backend ? ggml_backend_get_device(backend) : nullptr;
+    if (model_dev && ggml_backend_dev_type(model_dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        bufs = {tts_backend_get_buffer_type(backend), backend_cpu_buffer};
+        backs = {backend, backend_cpu};
+    } else {
+        bufs = {backend_cpu_buffer};
+        backs = {backend_cpu};
+    }
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backs.data(), bufs.data(), backs.size(), max_cross_nodes*n_layers, false);
     
     std::vector<uint8_t> buf_compute_meta;
     buf_compute_meta.resize(max_cross_nodes*n_layers*ggml_tensor_overhead() + ggml_graph_overhead_custom(max_cross_nodes*n_layers, false));
@@ -132,6 +140,9 @@ void parler_tts_model::prep_cross_key_values(int n_threads, struct tts_response 
         offset -= n_encode_length*hidden_size*sizeof(float)*n_layers*2;
         precomputed_input_emb = ggml_new_tensor_2d(cctx, GGML_TYPE_F32, conditional_prompt->hidden_size, conditional_prompt->n_outputs);
         ggml_set_input(precomputed_input_emb);
+        if (backend) {
+            ggml_backend_sched_set_tensor_backend(sched, precomputed_input_emb, backend);
+        }
         n_encode_length = conditional_prompt->n_outputs;
     }
     
@@ -150,24 +161,25 @@ void parler_tts_model::prep_cross_key_values(int n_threads, struct tts_response 
         ggml_set_name(v, ("cross_value_" + std::to_string(i)).c_str());
         ggml_build_forward_expand(gf, v);
     }
-    
-    ggml_free(cctx);
+
     ggml_backend_sched_reserve(sched, gf);
-    ggml_backend_sched_alloc_graph(sched, gf);
+    tts_backend_sched_alloc_graph_checked(sched, backend, gf, "parler.cross_attn_precompute");
     if (conditional_prompt) {
         ggml_backend_tensor_set(precomputed_input_emb, conditional_prompt->data, 0, conditional_prompt->n_outputs*conditional_prompt->hidden_size*ggml_element_size(precomputed_input_emb));
     }
 
     ggml_backend_sched_graph_compute_async(sched, gf);
+    ggml_backend_sched_synchronize(sched);
     
     for (int i = 0; i < layers.size(); i++) {
         struct ggml_tensor * k = ggml_graph_get_tensor(gf, ("cross_key_" + std::to_string(i)).c_str());
         layers[i]->cross_k = ggml_dup_tensor(ctx, k);
-        set_tensor(layers[i]->cross_k, k);
+        set_tensor_from_backend_tensor(layers[i]->cross_k, k);
         struct ggml_tensor * v = ggml_graph_get_tensor(gf, ("cross_value_" + std::to_string(i)).c_str());
         layers[i]->cross_v = ggml_dup_tensor(ctx, v);
-        set_tensor(layers[i]->cross_v, v);
+        set_tensor_from_backend_tensor(layers[i]->cross_v, v);
     }
+    ggml_free(cctx);
     ggml_backend_sched_free(sched);
     ggml_backend_free(backend_cpu);
 }
@@ -323,11 +335,7 @@ void parler_context::reset(int32_t n_output_heads) {
 
 struct parler_context * build_new_parler_context(struct parler_tts_model * model, int n_threads, bool use_cpu) {
     parler_context * pctx = new parler_context(model, n_threads);
-    if (!use_cpu) {
-#ifdef GGML_USE_METAL
-        pctx->backend = ggml_backend_metal_init();
-#endif
-    }
+    pctx->backend = tts_backend_init_accelerator(use_cpu);
     pctx->eos_seen.reserve(model->n_output_heads);
     pctx->backend_cpu = ggml_backend_cpu_init();
     pctx->set_threads();
@@ -340,11 +348,8 @@ static bool parler_kv_cache_init(struct parler_kv_cache * cache, parler_tts_mode
     const int64_t n_layer = (int64_t) model->layers.size();
 
     ggml_backend_buffer_type_t buft = nullptr;
-    // this will only really support cpu or metal for the time being;
     if (pctx->backend != nullptr) {
-#ifdef GGML_USE_METAL
-        buft = ggml_backend_metal_buffer_type();
-#endif
+        buft = tts_backend_get_buffer_type(pctx->backend);
     } else {
         buft = ggml_backend_cpu_buffer_type();
     }
@@ -390,9 +395,11 @@ struct ggml_tensor * parler_build_inp_embd(struct ggml_context * ctx, struct par
     struct ggml_tensor * input_embs;
     pctx->positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.sequence_length);
     ggml_set_input(pctx->positions);
+    pctx->set_tensor_backend(pctx->positions);
     if (batch.audio_generation) {
         pctx->audio_inp_tokens = ggml_reshape_2d(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.n_audio_tokens), batch.n_audio_tokens / model->n_output_heads, model->n_output_heads);
         ggml_set_input(pctx->audio_inp_tokens);
+        pctx->set_tensor_backend(pctx->audio_inp_tokens);
         struct ggml_tensor * audio_tokens = ggml_reshape_2d(ctx, pctx->audio_inp_tokens, batch.n_audio_tokens / model->n_output_heads, model->n_output_heads);
         for (int i = 0; i < model->n_output_heads; i++) {
             if (i == 0) {
@@ -404,6 +411,7 @@ struct ggml_tensor * parler_build_inp_embd(struct ggml_context * ctx, struct par
     } else {
         pctx->inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.n_tokens);
         ggml_set_input(pctx->inp_tokens);
+        pctx->set_tensor_backend(pctx->inp_tokens);
         input_embs = ggml_get_rows(ctx, model->prompt_embd, pctx->inp_tokens);
     }
     return ggml_add(ctx, input_embs, ggml_get_rows(ctx, model->precomputed_positional_embds, pctx->positions));
@@ -459,6 +467,7 @@ struct ggml_tensor * parler_build_head_outputs(struct ggml_context * ctx, parler
 struct ggml_tensor * build_attn_mask(ggml_context * ctx, parler_context * pctx, parler_ubatch & batch) {
     pctx->attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) pctx->current_position + batch.sequence_length, (int64_t) pctx->current_position + batch.sequence_length);
     ggml_set_input(pctx->attn_mask);
+    pctx->set_tensor_backend(pctx->attn_mask);
 
     return pctx->attn_mask;
 }
@@ -466,6 +475,7 @@ struct ggml_tensor * build_attn_mask(ggml_context * ctx, parler_context * pctx, 
 struct ggml_tensor * build_attn_mask_cross(ggml_context * ctx, parler_context * pctx, parler_tts_model * model, parler_ubatch & batch) {
     pctx->attn_mask_cross = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) model->n_encode_length, (int64_t) batch.sequence_length);
     ggml_set_input(pctx->attn_mask_cross);
+    pctx->set_tensor_backend(pctx->attn_mask_cross);
     
     return pctx->attn_mask_cross;
 }
@@ -509,11 +519,11 @@ void parler_tts_runner::assign_weight(const char * name, ggml_tensor & tensor) {
 
 void parler_tts_runner::update_conditional_prompt(const char * file_path, const char * prompt) {
     const int      n_threads{ pctx->n_threads };
-    constexpr bool cpu_only{true}; // TODO
+    const bool     cpu_only{ pctx->backend == nullptr };
     t5_runner * text_encoder = text_encoder_from_file(file_path, n_threads, tokenizer, cpu_only);
-    tts_response* response;
-    text_encoder->generate(prompt, response);
-    model->prep_cross_key_values(n_threads, response);
+    tts_response response;
+    text_encoder->generate(prompt, &response);
+    model->prep_cross_key_values(n_threads, &response);
     delete text_encoder;
 }
 
@@ -620,24 +630,19 @@ void parler_tts_runner::set_inputs(parler_ubatch & batch) {
         ggml_backend_tensor_set(pctx->inp_tokens, batch.tokens, 0, batch.n_tokens*ggml_element_size(pctx->inp_tokens));
     }
     ggml_backend_tensor_set(pctx->positions, batch.positions, 0, batch.sequence_length*ggml_element_size(pctx->positions));
-    float * d = nullptr;
-    d = (float *) pctx->attn_mask->data;
     uint32_t max_pos = pctx->current_position + batch.sequence_length;
+    std::vector<float> attn_mask((size_t) batch.sequence_length * max_pos);
     for (int i = 0; i < batch.sequence_length; i++) {
         uint32_t pos = batch.positions[i];
         for (int ii = 0; ii < max_pos; ii++) {
-            d[i*max_pos + ii] = ii > pos ? -INFINITY : 0.0f;
+            attn_mask[(size_t)i*max_pos + ii] = ii > pos ? -INFINITY : 0.0f;
         }
     }
+    ggml_backend_tensor_set(pctx->attn_mask, attn_mask.data(), 0, attn_mask.size() * sizeof(float));
     
     if (model->use_cross_attn) {
-        float * d2 = nullptr;
-        d2 = (float *) pctx->attn_mask_cross->data;
-        for (int i = 0; i < model->n_encode_length; i++) {
-            for (int ii = 0; ii < batch.sequence_length; ii++) {
-                d2[i*batch.sequence_length + ii] = 0.0f;
-            }
-        }
+        std::vector<float> attn_mask_cross((size_t) model->n_encode_length * batch.sequence_length, 0.0f);
+        ggml_backend_tensor_set(pctx->attn_mask_cross, attn_mask_cross.data(), 0, attn_mask_cross.size() * sizeof(float));
     }
 
 }
@@ -671,7 +676,7 @@ int parler_tts_runner::decode(parler_ubatch & batch) {
 
     // the output is always the last tensor in the graph
     struct ggml_tensor * res = gf->nodes[gf->n_nodes - 1];
-    ggml_backend_sched_alloc_graph(pctx->sched, gf);
+    pctx->alloc_graph(gf, "parler.decode");
     
     // use the sequence_length variable here so that audio input tokens are handled correctly.
     size_t n_outputs_new = batch.sequence_length;
@@ -837,12 +842,16 @@ void parler_tts_runner::just_audio_token_decode(uint32_t * tokens, int32_t sq_le
 
 void parler_tts_runner::generate(const char * sentence, tts_response & output,
                                  const generation_configuration & config) {
+    const uint32_t previous_max_generation_size = model->max_generation_size;
     sampler->temperature        = config.temperature;
     sampler->repetition_penalty = config.repetition_penalty;
     sampler->do_sample          = config.sample;
     sampler->top_k              = config.top_k;
     sampler->top_p              = config.top_p;
     model->use_cross_attn       = config.use_cross_attn;
+    if (config.max_tokens > 0) {
+        model->max_generation_size = config.max_tokens;
+    }
 
     parler_ubatch batch = batch_from_sentence(sentence, model, tokenizer);
     pctx->reset(model->n_output_heads);
@@ -851,8 +860,10 @@ void parler_tts_runner::generate(const char * sentence, tts_response & output,
     if (!kv_self) {
         kv_self = new parler_kv_cache;
         if (!parler_kv_cache_init(kv_self, model, pctx)) {
+            model->max_generation_size = previous_max_generation_size;
             return;
         }
     }
     generate_from_batch(batch, output);
+    model->max_generation_size = previous_max_generation_size;
 }

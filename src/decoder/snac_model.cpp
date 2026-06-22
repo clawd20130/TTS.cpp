@@ -88,10 +88,11 @@ static struct ggml_tensor * snac_build_audio_inputs(struct ggml_context * ctx, s
     // these devisors represent the discreate repeats performed against each of the three input heads.
     sctx->inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sequence_length / 4 + sequence_length / 2 + sequence_length);
     ggml_set_input(sctx->inp_tokens);
+    sctx->set_tensor_backend(sctx->inp_tokens);
     size_t last_stride = 0;
     for(int i = 0; i < sctx->model->n_heads; i++) {
         auto quantize_layer = sctx->model->quantizer_layers[i];
-        struct ggml_tensor * inp_head = ggml_cont(ctx, ggml_view_1d(ctx, sctx->inp_tokens, sequence_length / sctx->model->repeats[i], last_stride));
+        struct ggml_tensor * inp_head = ggml_view_1d(ctx, sctx->inp_tokens, sequence_length / sctx->model->repeats[i], last_stride);
         last_stride += (sequence_length / sctx->model->repeats[i]) * ggml_element_size(sctx->inp_tokens);
         struct ggml_tensor * code = general_neural_audio_codec::build_quantize_layer(ctx, inp_head, quantize_layer);
         if (sctx->model->repeats[i] > 1) {
@@ -110,11 +111,7 @@ static struct ggml_tensor * snac_build_audio_inputs(struct ggml_context * ctx, s
 
 snac_context * build_new_snac_context(struct snac_model * model, int n_threads, bool use_cpu) {
     snac_context * sctx = new snac_context(model, n_threads);
-    if (!use_cpu) {
-#ifdef GGML_USE_METAL
-        sctx->backend = ggml_backend_metal_init();
-#endif
-    }
+    sctx->backend = tts_backend_init_accelerator(use_cpu);
     sctx->backend_cpu = ggml_backend_cpu_init();
     sctx->set_threads();
     sctx->build_schedule();
@@ -136,6 +133,7 @@ struct ggml_cgraph * snac_runner::build_snac_graph(size_t sequence_length) {
 
     sctx->noise = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, model->noise_steps_sum * sequence_length);
     ggml_set_input(sctx->noise);
+    sctx->set_tensor_backend(sctx->noise);
     
     inputs = snac_build_audio_inputs(ctx, sctx, sequence_length, model->quantizer_layers);
     cur = ggml_conv_1d_dw(ctx, model->in_conv_kernel, inputs, 1, 3, 1);
@@ -175,7 +173,9 @@ void snac_runner::set_inputs(std::vector<std::vector<uint32_t>> & tokens) {
         tokens[2].size()*ggml_element_size(sctx->inp_tokens)
     );
     size_t sequence_length = tokens[2].size();
-    random_normal_gen(model->noise_steps_sum * sequence_length, (float*) sctx->noise->data);
+    std::vector<float> noise(model->noise_steps_sum * sequence_length);
+    random_normal_gen((int) noise.size(), noise.data());
+    ggml_backend_tensor_set(sctx->noise, noise.data(), 0, noise.size() * sizeof(float));
 }
 
 void snac_runner::run(std::vector<std::vector<uint32_t>> & tokens, struct tts_response * outputs) {
@@ -192,7 +192,7 @@ void snac_runner::run(std::vector<std::vector<uint32_t>> & tokens, struct tts_re
     
     // the output is always the last tensor in the graph
     struct ggml_tensor * result = gf->nodes[gf->n_nodes - 1];
-    ggml_backend_sched_alloc_graph(sctx->sched, gf);
+    sctx->alloc_graph(gf, "snac.decode");
 
     set_inputs(tokens);
 
@@ -206,4 +206,3 @@ void snac_runner::run(std::vector<std::vector<uint32_t>> & tokens, struct tts_re
     outputs->n_outputs = sequence_length * model->up_sampling_factor;
     return;
 }
-

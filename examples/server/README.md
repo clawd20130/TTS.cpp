@@ -27,6 +27,8 @@ In order to get a detailed breakdown of the functionality currently available yo
     (OPTIONAL) The server side timeout on http calls in seconds. Defaults to 300 seconds.
 --n-parallelism (-np):
     (OPTIONAL) the number of parallel models to run asynchronously. Deafults to 1.
+--backend (-b):
+    (OPTIONAL) Runtime backend: auto, cpu, metal, or vulkan. Overrides TTS_BACKEND.
 --use-metal (-m):
     (OPTIONAL) Whether to use metal acceleration
 --no-cross-attn (-ca):
@@ -56,6 +58,12 @@ Simple local usage can be achieved via the following simple command:
 ```
 
 This will run the server on port `8080` via host `127.0.0.1`.
+
+Backend selection can be controlled with `--backend` or the `TTS_BACKEND`
+environment variable. For example, a Vulkan build can be started with
+`./build/bin/tts-server --backend vulkan --model-path /path/to/model.gguf`.
+`TTS_DEVICE` selects a backend-local device index, and `TTS_BACKEND_STRICT=1`
+prevents silent fallback if the requested accelerator is unavailable.
 
 ### Usage
 

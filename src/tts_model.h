@@ -13,6 +13,12 @@ void append_to_response(tts_response & response, tts_response & to_append);
 
 using tensor_meta_callback = std::function<void(ggml_tensor*)>*;
 
+ggml_backend_t tts_backend_init_accelerator(bool cpu_only);
+ggml_backend_t tts_backend_init_model(bool cpu_only);
+ggml_backend_buffer_type_t tts_backend_get_buffer_type(ggml_backend_t backend);
+void tts_backend_sched_alloc_graph_checked(ggml_backend_sched_t sched, ggml_backend_t required_backend,
+                                           ggml_cgraph * gf, const char * graph_name);
+
 struct runner_context {
     runner_context(int n_threads): n_threads(n_threads) {};
     virtual ~runner_context() {
@@ -39,7 +45,9 @@ struct runner_context {
     void get_ggml_node_data(struct ggml_tensor * output_tensor, float * output, size_t output_size, ggml_backend_buffer_t buffer = nullptr);
     void set_threads();
     void build_schedule(size_t max_nodes);
+    void set_tensor_backend(ggml_tensor * tensor);
     bool prep_schedule(ggml_cgraph * gf);
+    void alloc_graph(ggml_cgraph * gf, const char * graph_name);
     void prep_output_buffer(size_t new_size);
 };
 
@@ -64,6 +72,7 @@ struct tts_model {
     void prep_buffers_and_context(bool cpu_only, float size_offset, uint32_t dedicated_add_on_size);
     void setup_from_file(gguf_context * meta_ctx, ggml_context * load_context, bool cpu_only, std::string model_prefix, float size_offset = 1.4, uint32_t dedicated_add_on_size = 0);
     void set_tensor(struct ggml_tensor * tensor, struct ggml_tensor * target);
+    void set_tensor_from_backend_tensor(struct ggml_tensor * tensor, struct ggml_tensor * target);
     size_t max_nodes();
     void assign_weight(std::string name, ggml_tensor * tensor);
     void free();

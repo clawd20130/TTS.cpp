@@ -42,6 +42,7 @@ nppBackup
 
 .build/
 build/*
+build-*/
 /libltts.so
 cmake-build-*
 CMakeSettings.json

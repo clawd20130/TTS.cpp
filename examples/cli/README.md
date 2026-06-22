@@ -24,9 +24,11 @@ In order to get a detailed breakdown the functionality currently available you c
 --topk (-tk):
     (OPTIONAL) When set to an integer value greater than 0 generation uses nucleus sampling over topk nucleaus size. Defaults to 50.
 --max-tokens (-mt):
-    (OPTIONAL) The max audio tokens or token batches to generate where each represents approximates 11 ms of audio. Only applied to Dia generation. If set to zero as is its default then the default max generation size. Warning values under 15 are not supported.
+    (OPTIONAL) The max audio tokens or token batches to generate for autoregressive models. If set to zero as is its default then the model default max generation size is used. Dia values under 15 are not supported.
 --use-metal (-m):
     (OPTIONAL) Whether to use metal acceleration
+--backend (-b):
+    (OPTIONAL) Runtime backend: auto, cpu, metal, or vulkan. Overrides TTS_BACKEND.
 --no-cross-attn (-ca):
     (OPTIONAL) Whether to not include cross attention
 --vad (-va):
@@ -54,6 +56,14 @@ General usage should follow from these possible parameters. E.G. The following c
 ```bash
 ./tts-cli --model-path /model/path/to/gguf_file.gguf --prompt "I am saying some words" --save-path /tmp/test.wav
 ```
+
+Backend selection can be driven either by `--backend` or the `TTS_BACKEND`
+environment variable. `--backend cpu` forces CPU execution. `--backend auto`
+uses the best available accelerator reported by ggml. `--backend vulkan`
+requests the Vulkan backend when TTS.cpp is built with `GGML_VULKAN=ON`.
+`TTS_DEVICE` can be set to a non-negative backend-local device index, and
+`TTS_BACKEND_STRICT=1` fails early instead of falling back when the requested
+accelerator cannot be initialized.
 
 #### Dia and Orpheus Generation Arguments
 
@@ -122,4 +132,3 @@ By default when a voice of a specific language is used, phonemization for that l
 ```bash
 espeak-ng --voices
 ```
-

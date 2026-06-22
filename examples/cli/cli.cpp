@@ -1,5 +1,7 @@
 #include <thread>
 
+#include <cstdlib>
+
 #include "../../src/models/loaders.h"
 #include "args.h"
 #include "common.h"
@@ -21,6 +23,17 @@ public:
     }
 };
 
+static void set_backend_env(const std::string & backend) {
+    if (backend.empty()) {
+        return;
+    }
+#ifdef _WIN32
+    _putenv_s("TTS_BACKEND", backend.c_str());
+#else
+    setenv("TTS_BACKEND", backend.c_str(), 1);
+#endif
+}
+
 int main(int argc, const char ** argv) {
     const tts_timing_printer _{};
     float default_temperature = 1.0f;
@@ -37,6 +50,7 @@ int main(int argc, const char ** argv) {
     args.add_argument(int_arg("--n-threads", "The number of cpu threads to run generation with. Defaults to hardware concurrency. If hardware concurrency cannot be determined then it defaults to 1.", "-nt", false, &default_n_threads));
     args.add_argument(int_arg("--topk", "(OPTIONAL) When set to an integer value greater than 0 generation uses nucleus sampling over topk nucleaus size. Defaults to 50.", "-tk", false, &default_top_k));
     args.add_argument(float_arg("--repetition-penalty", "The by channel repetition penalty to be applied the sampled output of the model. defaults to 1.0.", "-r", false, &default_repetition_penalty));
+    args.add_argument(string_arg("--backend", "(OPTIONAL) Runtime backend: auto, cpu, metal, or vulkan. Overrides TTS_BACKEND.", "-b", false));
     args.add_argument(bool_arg("--use-metal", "(OPTIONAL) Whether to use metal acceleration", "-m"));
     args.add_argument(bool_arg("--no-cross-attn", "(OPTIONAL) Whether to not include cross attention", "-ca"));
     args.add_argument(string_arg("--conditional-prompt", "(OPTIONAL) A distinct conditional prompt to use for generating. If none is provided the preencoded prompt is used. '--text-encoder-path' must be set to use conditional generation.", "-cp", false));
@@ -44,8 +58,9 @@ int main(int argc, const char ** argv) {
     args.add_argument(string_arg("--voice", "(OPTIONAL) The voice to use to generate the audio. This is only used for models with voice packs.", "-v", false, ""));
     args.add_argument(bool_arg("--vad", "(OPTIONAL) whether to apply voice inactivity detection (VAD) and strip silence form the end of the output (particularly useful for Parler TTS). By default, no VAD is applied.", "-va"));
     args.add_argument(string_arg("--espeak-voice-id", "(OPTIONAL) The espeak voice id to use for phonemization. This should only be specified when the correct espeak voice cannot be inferred from the kokoro voice ( see MultiLanguage Configuration in the README for more info).", "-eid", false));
-    args.add_argument(int_arg("--max-tokens", "(OPTIONAL) The max audio tokens or token batches to generate where each represents approximates 11 ms of audio. Only applied to Dia generation. If set to zero as is its default then the default max generation size. Warning values under 15 are not supported.", "-mt", false, &default_max_tokens));
+    args.add_argument(int_arg("--max-tokens", "(OPTIONAL) The max audio tokens or token batches to generate for autoregressive models. If set to zero as is its default then the model default max generation size is used. Dia values under 15 are not supported.", "-mt", false, &default_max_tokens));
     args.add_argument(float_arg("--top-p", "(OPTIONAL) the sum of probabilities to sample over. Must be a value between 0.0 and 1.0. Defaults to 1.0.", "-tp", false, &default_top_p));
+    args.add_argument(bool_arg("--input-phonemes", "(OPTIONAL) Treat --prompt as model-ready phonemes and skip Kokoro phonemization.", "-ip"));
     register_play_tts_response_args(args);
     args.parse(argc, argv);
     if (args.for_help) {
@@ -53,6 +68,7 @@ int main(int argc, const char ** argv) {
         exit(0);
     }
     args.validate();
+    set_backend_env(args.get_string_param("--backend"));
 
     std::string conditional_prompt = args.get_string_param("--conditional-prompt");
     std::string text_encoder_path = args.get_string_param("--text-encoder-path");
@@ -74,7 +90,9 @@ int main(int argc, const char ** argv) {
         !args.get_bool_param("--no-cross-attn"),
         args.get_string_param("--espeak-voice-id"),
         *args.get_int_param("--max-tokens"),
-        *args.get_float_param("--top-p")};
+        *args.get_float_param("--top-p"),
+        true,
+        args.get_bool_param("--input-phonemes")};
 
     unique_ptr<tts_generation_runner> runner{runner_from_file(args.get_string_param("--model-path").c_str(), *args.get_int_param("--n-threads"), config, !args.get_bool_param("--use-metal"))};
 

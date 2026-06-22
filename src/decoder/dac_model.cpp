@@ -102,15 +102,12 @@ static struct ggml_tensor * dac_build_audio_inputs(struct ggml_context * ctx, st
     
     dctx->inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.sequence_length*dctx->model->n_heads);
     ggml_set_input(dctx->inp_tokens);
-
-    if (dctx->backend) {
-        ggml_backend_sched_set_tensor_backend(dctx->sched, dctx->inp_tokens, dctx->backend);
-    }
+    dctx->set_tensor_backend(dctx->inp_tokens);
 
     for(int i = 0; i < dctx->model->n_heads; i++) {
         auto quantize_layer = dctx->model->quantizer_layers[i];
-        struct ggml_tensor * code = ggml_cont(ctx, ggml_view_2d(ctx, dctx->inp_tokens, 1, batch.sequence_length, dctx->model->n_heads*ggml_type_size(GGML_TYPE_I32), i*ggml_type_size(GGML_TYPE_I32)));
-        code = ggml_reshape_1d(ctx, code, batch.sequence_length);
+        struct ggml_tensor * code = ggml_view_1d(ctx, dctx->inp_tokens, batch.sequence_length, i*ggml_type_size(GGML_TYPE_I32));
+        code->nb[0] = dctx->model->n_heads*ggml_type_size(GGML_TYPE_I32);
         code = general_neural_audio_codec::build_quantize_layer(ctx, code, quantize_layer);
 
         if (i == 0) {
@@ -124,11 +121,7 @@ static struct ggml_tensor * dac_build_audio_inputs(struct ggml_context * ctx, st
 
 struct dac_context * build_new_dac_context(struct dac_model * model, int n_threads, bool use_cpu) {
     dac_context * dctx = new dac_context(model, n_threads);
-    if (!use_cpu) {
-#ifdef GGML_USE_METAL
-        dctx->backend = ggml_backend_metal_init();
-#endif
-    }
+    dctx->backend = tts_backend_init_accelerator(use_cpu);
     dctx->backend_cpu = ggml_backend_cpu_init();
     dctx->set_threads();
     dctx->build_schedule();
@@ -196,7 +189,7 @@ void dac_runner::run(uint32_t * input_tokens, uint32_t sequence_length, struct t
     
     // the output is always the last tensor in the graph
     struct ggml_tensor * result = gf->nodes[gf->n_nodes - 1];
-    ggml_backend_sched_alloc_graph(dctx->sched, gf);
+    dctx->alloc_graph(gf, "dac.decode");
     
     ggml_backend_tensor_set(dctx->inp_tokens, batch.input_tokens, 0, batch.sequence_length*model->n_heads*ggml_element_size(dctx->inp_tokens));
 

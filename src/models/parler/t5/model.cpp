@@ -164,11 +164,7 @@ void t5_encoder::assign_weight(std::string name, ggml_tensor * tensor) {
 
 struct t5_context * build_new_t5_context(struct t5_encoder * model, int n_threads, bool use_cpu) {
 	t5_context * t5ctx = new t5_context(model, n_threads);
-    if (!use_cpu) {
-#ifdef GGML_USE_METAL
-        t5ctx->backend = ggml_backend_metal_init();
-#endif
-    }
+    t5ctx->backend = tts_backend_init_accelerator(use_cpu);
     t5ctx->backend_cpu = ggml_backend_cpu_init();
     t5ctx->set_threads();
     t5ctx->build_schedule();
@@ -187,6 +183,7 @@ static struct ggml_tensor * build_t5_norm(struct ggml_context * ctx, struct ggml
 static struct ggml_tensor * build_t5_attn_mask(ggml_context * ctx, struct t5_context *t5ctx, const t5_ubatch & batch) {
     t5ctx->attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) batch.n_tokens, (int64_t) batch.n_tokens);
     ggml_set_input(t5ctx->attn_mask);
+    t5ctx->set_tensor_backend(t5ctx->attn_mask);
 
     return t5ctx->attn_mask;
 }
@@ -225,9 +222,11 @@ struct ggml_cgraph * t5_runner::build_t5_graph(t5_ubatch & batch) {
 
     t5ctx->inp_pos_bucket = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, batch.n_tokens, batch.n_tokens);
     ggml_set_input(t5ctx->inp_pos_bucket);
+    t5ctx->set_tensor_backend(t5ctx->inp_pos_bucket);
 
     t5ctx->inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.n_tokens);
     ggml_set_input(t5ctx->inp_tokens);
+    t5ctx->set_tensor_backend(t5ctx->inp_tokens);
 
     inpL = ggml_get_rows(ctx, model->embd, t5ctx->inp_tokens);
 
@@ -299,12 +298,8 @@ struct ggml_cgraph * t5_runner::build_t5_graph(t5_ubatch & batch) {
 
 void t5_runner::set_inputs(t5_ubatch & batch) {
     ggml_backend_tensor_set(t5ctx->inp_tokens, batch.input_tokens, 0, batch.n_tokens*ggml_element_size(t5ctx->inp_tokens));
-    float * attn_mask = nullptr;
-    uint32_t * positions = nullptr;
-    uint32_t * pos_bucket = nullptr;
-    attn_mask = (float *) t5ctx->attn_mask->data;
-    positions = (uint32_t *) t5ctx->positions->data;
-    pos_bucket = (uint32_t *) t5ctx->inp_pos_bucket->data;
+    std::vector<float> attn_mask(batch.n_tokens * batch.n_tokens);
+    std::vector<uint32_t> pos_bucket(batch.n_tokens * batch.n_tokens);
     int n_buckets = (int) model->relative_attn_buckets / 2;
     int max_exact = (int) n_buckets / 2;
 	float logarithmic_denominator = log(128.0 / max_exact);
@@ -316,6 +311,8 @@ void t5_runner::set_inputs(t5_ubatch & batch) {
             pos_bucket[i*batch.n_tokens + ii] = (uint32_t) (rpos > 0 ? n_buckets : 0) + (ab_rpos < max_exact ? ab_rpos : std::min((n_buckets - 1), (max_exact + (int)((log((ab_rpos / max_exact)) / logarithmic_denominator) * max_exact))));
         }
     }
+    ggml_backend_tensor_set(t5ctx->attn_mask, attn_mask.data(), 0, attn_mask.size() * sizeof(float));
+    ggml_backend_tensor_set(t5ctx->inp_pos_bucket, pos_bucket.data(), 0, pos_bucket.size() * sizeof(uint32_t));
 
 }
 
@@ -344,7 +341,7 @@ void t5_runner::run(uint32_t * input_tokens, uint32_t sequence_length, struct tt
     gf = build_t5_graph(batch);
     // the output is always the last tensor in the graph
     struct ggml_tensor * result = gf->nodes[gf->n_nodes - 1];
-    ggml_backend_sched_alloc_graph(t5ctx->sched, gf);
+    t5ctx->alloc_graph(gf, "parler.t5_encoder");
     set_inputs(batch);
 
     ggml_backend_sched_graph_compute_async(t5ctx->sched, gf);

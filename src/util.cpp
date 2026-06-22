@@ -85,12 +85,7 @@ float round_to_float(double v) {
 
 struct ggml_tensor * reciprocal(ggml_context * ctx, struct ggml_tensor * x) {
     TTS_ASSERT(x->ne[0] == 1);
-    static constexpr float one = 1.0f;
-    ggml_tensor * numerator = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, x->ne[1]);
-    // stride trick so that the scalar numerator can be divided by x.
-    numerator->nb[1] = 0;
-    numerator->data = const_cast<float *>(&one);
-    return ggml_div(ctx, numerator, x);
+    return ggml_reciprocal(ctx, x);
 }
 
 // Described in https://arxiv.org/abs/2006.08195
@@ -166,34 +161,6 @@ void uv_noise_compute(struct ggml_tensor * dst, const struct ggml_tensor * a, co
                     uv_dst[index] = 0.0f;
                     noise_dst[index] = sin_amp_div * rand_init[index];
                 }
-            }
-        }
-    }
-}
-
-// This is a custom map op for applying cfg scale. It is used at the terminus of logit generation in Dia.
-void cfg_scale(struct ggml_tensor * dst, const struct ggml_tensor * a, const struct ggml_tensor * b, int ith, int nth, void * userdata) {
-    const float scale = ((float *) userdata)[0];
-    const float max_output = ((float*) userdata)[1];
-    const int rpt = (b->ne[0] + nth - 1)/nth;
-    const int start = ith * rpt;
-    const int end = MIN((ith + 1) * rpt, b->ne[0]);
-
-    float * output = (float *) dst->data;
-    float * cond = (float *) a->data;
-    float * uncond = (float *) b->data;
-
-    for(int bt = 0; bt < b->ne[2]; bt++) {
-        for (int h = 0; h < b->ne[1]; h++) {
-            int i = (h * b->ne[0]) + (bt * b->ne[0] * b->ne[1]);
-            for(int r = start; r < end; r++) {
-                // only let the output heads yield tokens up to EOS
-                if (r > max_output) {
-                    output[i+r] = -INFINITY;
-                }
-                const float cr = cond[i+r];
-                const float ur = uncond[i+r];
-                output[i+r] = cr + scale * (cr - ur);
             }
         }
     }

@@ -259,11 +259,7 @@ void dia_context::reset() {
 
 struct dia_context * build_new_dia_context(struct dia_model * model, int n_threads, bool use_cpu) {
     dia_context * dctx = new dia_context(model, n_threads);
-    if (!use_cpu) {
-#ifdef GGML_USE_METAL
-        dctx->backend = ggml_backend_metal_init();
-#endif
-    }
+    dctx->backend = tts_backend_init_accelerator(use_cpu);
     dctx->backend_cpu = ggml_backend_cpu_init();
     dctx->set_threads();
     dctx->build_schedule();
@@ -273,11 +269,8 @@ struct dia_context * build_new_dia_context(struct dia_model * model, int n_threa
 
 static bool dia_kv_cache_init(struct dia_kv_cache * cache, dia_model * model, dia_context * dctx) {    
     ggml_backend_buffer_type_t buft = nullptr;
-    // this will only really support cpu or metal for the time being;
     if (dctx->backend != nullptr) {
-#ifdef GGML_USE_METAL
-        buft = ggml_backend_metal_buffer_type();
-#endif
+        buft = tts_backend_get_buffer_type(dctx->backend);
     } else {
         buft = ggml_backend_cpu_buffer_type();
     }
@@ -329,6 +322,7 @@ static struct ggml_tensor * build_dia_decoder_inp_embd(struct ggml_context * ctx
 
     dctx->audio_inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_output_heads * 2);
     ggml_set_input(dctx->audio_inp_tokens);
+    dctx->set_tensor_backend(dctx->audio_inp_tokens);
     for (int i = 0; i < n_output_heads; i++) {
         struct ggml_tensor * view = ggml_view_1d(ctx, dctx->audio_inp_tokens, 2, i * ggml_element_size(dctx->audio_inp_tokens));
         view->nb[0] = n_output_heads * ggml_element_size(dctx->audio_inp_tokens);
@@ -351,6 +345,7 @@ static struct ggml_tensor * dia_layer_norm(struct ggml_context * ctx, struct ggm
 static struct ggml_tensor * build_dia_encoder_attn_mask(ggml_context * ctx, struct dia_context * dctx, dia_model * model) {
     dctx->encode_attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) model->max_encoder_context_length, (int64_t) model->max_encoder_context_length);
     ggml_set_input(dctx->encode_attn_mask);
+    dctx->set_tensor_backend(dctx->encode_attn_mask);
 
     return dctx->encode_attn_mask;
 }
@@ -367,15 +362,17 @@ static struct ggml_tensor * build_dia_head_outputs(struct ggml_context * ctx, di
     }
     struct ggml_tensor * cond = ggml_cont(ctx, ggml_view_2d(ctx, out, out->ne[0], out->ne[2], out->nb[2], 0));
     struct ggml_tensor * uncond = ggml_cont(ctx, ggml_view_2d(ctx, out, out->ne[0], out->ne[2], out->nb[2], out->nb[1]));
-    return ggml_map_custom2(ctx, cond, uncond, &cfg_scale, out->ne[0], &model->cfg_scale_data);
+    return ggml_add(ctx, cond, ggml_scale(ctx, ggml_add(ctx, cond, ggml_scale(ctx, uncond, -1.0f)), model->cfg_scale_data[0]));
 }
 
 static struct ggml_tensor * build_dia_encoder(ggml_context * ctx, dia_model * model, dia_context * dctx, dia_ubatch & batch) {
     dctx->inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, model->max_encoder_context_length*2);
     ggml_set_input(dctx->inp_tokens);
+    dctx->set_tensor_backend(dctx->inp_tokens);
 
     dctx->encode_positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, model->max_encoder_context_length);
     ggml_set_input(dctx->encode_positions);
+    dctx->set_tensor_backend(dctx->encode_positions);
 
     struct ggml_tensor * attn_mask = build_dia_encoder_attn_mask(ctx, dctx, model);
 
@@ -523,6 +520,7 @@ static struct ggml_tensor * build_dia_decoder(
         struct ggml_tensor * encoder_hidden_states) {
     dctx->positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.sequence_length);
     ggml_set_input(dctx->positions);
+    dctx->set_tensor_backend(dctx->positions);
     struct ggml_tensor * cur = build_dia_decoder_inp_embd(ctx, dctx, model->decoder, batch, model->n_output_heads);
 
     for (int l = 0; l < model->decoder->layers.size(); l++){
@@ -723,23 +721,32 @@ struct ggml_cgraph * dia_runner::build_dia_graph(dia_ubatch & batch) {
 void dia_runner::set_inputs(dia_ubatch & batch) {
     if (batch.encoder_step) {
         ggml_backend_tensor_set(dctx->inp_tokens, batch.tokens.data(), 0, batch.tokens.size()*ggml_element_size(dctx->inp_tokens));
-        int32_t * ep = (int32_t*) dctx->encode_positions->data;
-        float * mask = (float*) dctx->encode_attn_mask->data;
+        std::vector<int32_t> encode_positions(model->max_encoder_context_length);
+        std::vector<float> encode_attn_mask((size_t) model->max_encoder_context_length * model->max_encoder_context_length);
         for (int i = 0; i < model->max_encoder_context_length; i++) {
-            ep[i] = (int32_t) i;
+            encode_positions[i] = (int32_t) i;
             for (int ii = 0; ii < model->max_encoder_context_length; ii++) {
                 if (i < batch.sentence_length) {
-                    mask[i*model->max_encoder_context_length + ii] = ii < batch.sentence_length ? 0.0 : -INFINITY;
+                    encode_attn_mask[(size_t)i*model->max_encoder_context_length + ii] = ii < batch.sentence_length ? 0.0 : -INFINITY;
                 } else {
-                    mask[i*model->max_encoder_context_length + ii] = ii >= batch.sentence_length ? 0.0 : -INFINITY;
+                    encode_attn_mask[(size_t)i*model->max_encoder_context_length + ii] = ii >= batch.sentence_length ? 0.0 : -INFINITY;
                 }
             }
         }
+        ggml_backend_tensor_set(dctx->encode_positions, encode_positions.data(), 0, encode_positions.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(dctx->encode_attn_mask, encode_attn_mask.data(), 0, encode_attn_mask.size() * sizeof(float));
     }
     // The audio tokens need to be repeated in the input in order to support cfg-scaling. I.E we need duplicate inputs for conditional and unconditional logits.
-    ggml_backend_tensor_set(dctx->audio_inp_tokens, batch.audio_tokens.data(), 0, batch.audio_tokens.size()*ggml_element_size(dctx->audio_inp_tokens));
-    ggml_backend_tensor_set(dctx->audio_inp_tokens, batch.audio_tokens.data(), batch.audio_tokens.size()*ggml_element_size(dctx->audio_inp_tokens), batch.audio_tokens.size()*ggml_element_size(dctx->audio_inp_tokens));
-    ((int32_t*) dctx->positions->data)[0] = dctx->current_position;
+    std::vector<uint32_t> audio_tokens;
+    audio_tokens.reserve(batch.audio_tokens.size() * 2);
+    audio_tokens.insert(audio_tokens.end(), batch.audio_tokens.begin(), batch.audio_tokens.end());
+    audio_tokens.insert(audio_tokens.end(), batch.audio_tokens.begin(), batch.audio_tokens.end());
+    ggml_backend_tensor_set(dctx->audio_inp_tokens, audio_tokens.data(), 0, audio_tokens.size()*ggml_element_size(dctx->audio_inp_tokens));
+    std::vector<int32_t> positions(batch.sequence_length);
+    for (uint32_t i = 0; i < batch.sequence_length; ++i) {
+        positions[i] = (int32_t) dctx->current_position + (int32_t) i;
+    }
+    ggml_backend_tensor_set(dctx->positions, positions.data(), 0, positions.size() * sizeof(int32_t));
 }
 
 int dia_runner::decode(dia_ubatch & batch) {
@@ -770,7 +777,7 @@ int dia_runner::decode(dia_ubatch & batch) {
     // the output is always the last tensor in the graph
     struct ggml_tensor * res = gf->nodes[gf->n_nodes - 1];
     std::string resname = ggml_get_name(res);
-    ggml_backend_sched_alloc_graph(dctx->sched, gf);
+    dctx->alloc_graph(gf, "dia.decode");
 
     set_inputs(batch);
 

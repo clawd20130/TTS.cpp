@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstddef>
 #include <deque>
 #include <filesystem>
@@ -400,6 +401,17 @@ inline void signal_handler(int signal) {
     shutdown_handler(signal);
 }
 
+static void set_backend_env(const std::string & backend) {
+    if (backend.empty()) {
+        return;
+    }
+#ifdef _WIN32
+    _putenv_s("TTS_BACKEND", backend.c_str());
+#else
+    setenv("TTS_BACKEND", backend.c_str(), 1);
+#endif
+}
+
 int main(int argc, const char ** argv) {
     int default_n_threads = std::max((int)std::thread::hardware_concurrency(), 1);
     int default_http_threads = std::max((int)std::thread::hardware_concurrency() - 1, 3);
@@ -419,6 +431,7 @@ int main(int argc, const char ** argv) {
     args.add_argument(string_arg("--model-path", "(REQUIRED) The local path of the gguf model file or a directory containing only gguf model files for Parler TTS mini or large v1, Dia, or Kokoro.", "-mp", true));
     args.add_argument(string_arg("--default-model", "(OPTIONAL) The default model to use when multiple models (a directory with multiple GGUF files) are provided. This can be set by giving the path to the model (./models/Kokoro_no_espeak.gguf), the filename (Kokoro_no_espeak.gguf), or the model ID itself (Kokoro_no_espeak).", "-dm", false));
     args.add_argument(int_arg("--n-threads", "The number of cpu threads to run generation with. Defaults to hardware concurrency.", "-nt", false, &default_n_threads));
+    args.add_argument(string_arg("--backend", "(OPTIONAL) Runtime backend: auto, cpu, metal, or vulkan. Overrides TTS_BACKEND.", "-b", false));
     args.add_argument(bool_arg("--use-metal", "(OPTIONAL) Whether to use metal acceleration", "-m"));
     args.add_argument(bool_arg("--no-cross-attn", "(OPTIONAL) Whether to not include cross attention", "-ca"));
     args.add_argument(string_arg("--text-encoder-path", "(OPTIONAL) The local path of the text encoder gguf model for conditional generaiton.", "-tep", false));
@@ -439,6 +452,7 @@ int main(int argc, const char ** argv) {
         return 0;
     }
     args.validate();
+    set_backend_env(args.get_string_param("--backend"));
 
     if (*args.get_float_param("--top-p") > 1.0f || *args.get_float_param("--top-p") <= 0.0f) {
         fprintf(stderr, "The '--top-p' value must be between 0.0 and 1.0. It was set to '%.6f'.\n", *args.get_float_param("--top-p"));
@@ -679,6 +693,10 @@ int main(int argc, const char ** argv) {
 
         if (data.contains("voice") && data.at("voice").is_string()) {
             conf.voice = data.at("voice").get<std::string>();
+        }
+
+        if (data.contains("input_phonemes") && data.at("input_phonemes").is_boolean()) {
+            conf.input_phonemes = data.at("input_phonemes").get<bool>();
         }
 
         if (data.contains("model") && data.at("model").is_string()) {

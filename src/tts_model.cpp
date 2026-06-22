@@ -1,9 +1,220 @@
 #include "tts_model.h"
 #include "llama-mmap.h"
 
+#include <cerrno>
+#include <cctype>
+#include <climits>
+#include <cstdio>
+#include <cstdlib>
+
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "models/loaders.h"
+
+namespace {
+bool tts_iequals(const char * a, const char * b) {
+    if (!a || !b) {
+        return false;
+    }
+    while (*a && *b) {
+        if (std::tolower((unsigned char) *a) != std::tolower((unsigned char) *b)) {
+            return false;
+        }
+        ++a;
+        ++b;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+bool tts_parse_non_negative_int(const char * s, int & out) {
+    if (!s || s[0] == '\0') {
+        return false;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    long v = std::strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v < 0 || v > INT_MAX) {
+        return false;
+    }
+
+    out = (int) v;
+    return true;
+}
+
+const char * tts_backend_env() {
+    const char * env = std::getenv("TTS_BACKEND");
+    return env && env[0] ? env : nullptr;
+}
+
+int tts_backend_device_index() {
+    const char * env = std::getenv("TTS_DEVICE");
+    if (!env || env[0] == '\0') {
+        return -1;
+    }
+
+    int parsed = -1;
+    if (!tts_parse_non_negative_int(env, parsed)) {
+        fprintf(stderr, "  [backend] Invalid TTS_DEVICE=%s, using default device\n", env);
+        return -1;
+    }
+    return parsed;
+}
+
+bool tts_backend_strict() {
+    const char * env = std::getenv("TTS_BACKEND_STRICT");
+    return env && env[0] && !tts_iequals(env, "0") && !tts_iequals(env, "false");
+}
+
+ggml_backend_t tts_init_named_backend(const char * target_backend_name) {
+    const int target_idx = tts_backend_device_index();
+    int matched_devices = 0;
+
+    const size_t n_devs = ggml_backend_dev_count();
+    for (size_t i = 0; i < n_devs; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+        if (!reg_name || !tts_iequals(reg_name, target_backend_name)) {
+            continue;
+        }
+
+        if (target_idx >= 0 && matched_devices != target_idx) {
+            ++matched_devices;
+            continue;
+        }
+
+        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+        if (backend) {
+            return backend;
+        }
+
+        if (target_idx >= 0) {
+            break;
+        }
+        ++matched_devices;
+    }
+
+    if (target_idx >= 0) {
+        fprintf(stderr, "  [backend] Requested %s device index %d not available\n",
+                target_backend_name, target_idx);
+    }
+    return nullptr;
+}
+
+ggml_backend_t tts_init_requested_accelerator() {
+    const char * env = tts_backend_env();
+    ggml_backend_t backend = nullptr;
+
+    if (!env || tts_iequals(env, "auto") || tts_iequals(env, "gpu")) {
+        backend = ggml_backend_init_best();
+    } else if (tts_iequals(env, "vulkan") || tts_iequals(env, "vk")) {
+        backend = tts_init_named_backend("Vulkan");
+    } else if (tts_iequals(env, "metal")) {
+        backend = tts_init_named_backend("Metal");
+    } else if (tts_iequals(env, "cpu")) {
+        return nullptr;
+    } else {
+        fprintf(stderr, "  [backend] Unknown TTS_BACKEND=%s, using auto\n", env);
+        backend = ggml_backend_init_best();
+    }
+
+    if (!backend) {
+        return nullptr;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        ggml_backend_free(backend);
+        return nullptr;
+    }
+
+    return backend;
+}
+
+bool tts_should_try_accelerator(bool cpu_only) {
+    const char * env = tts_backend_env();
+    if (!env) {
+        return !cpu_only;
+    }
+    return !tts_iequals(env, "cpu");
+}
+
+size_t tts_pad_to_alignment(size_t offset, size_t alignment) {
+    if (alignment == 0) {
+        return offset;
+    }
+    TTS_ASSERT((alignment & (alignment - 1)) == 0);
+    return (offset + alignment - 1) & ~(alignment - 1);
+}
+}
+
+ggml_backend_t tts_backend_init_accelerator(bool cpu_only) {
+    if (!tts_should_try_accelerator(cpu_only)) {
+        return nullptr;
+    }
+
+    ggml_backend_t backend = tts_init_requested_accelerator();
+    if (!backend && tts_backend_strict()) {
+        TTS_ABORT("Failed to initialize requested TTS accelerator backend. Set TTS_BACKEND=cpu to force CPU.\n");
+    }
+    return backend;
+}
+
+ggml_backend_t tts_backend_init_model(bool cpu_only) {
+    ggml_backend_t backend = tts_backend_init_accelerator(cpu_only);
+    if (!backend) {
+        backend = ggml_backend_cpu_init();
+    }
+    return backend;
+}
+
+ggml_backend_buffer_type_t tts_backend_get_buffer_type(ggml_backend_t backend) {
+    return backend ? ggml_backend_get_default_buffer_type(backend) : ggml_backend_cpu_buffer_type();
+}
+
+static bool tts_is_view_op(enum ggml_op op) {
+    return op == GGML_OP_VIEW ||
+        op == GGML_OP_RESHAPE ||
+        op == GGML_OP_PERMUTE ||
+        op == GGML_OP_TRANSPOSE;
+}
+
+static bool tts_backend_is_cpu(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = backend ? ggml_backend_get_device(backend) : nullptr;
+    return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+void tts_backend_sched_alloc_graph_checked(ggml_backend_sched_t sched, ggml_backend_t required_backend,
+                                           ggml_cgraph * gf, const char * graph_name) {
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        TTS_ABORT("Failed to allocate ggml graph '%s'.\n", graph_name ? graph_name : "<unnamed>");
+    }
+
+    if (!required_backend || !tts_backend_strict() || tts_backend_is_cpu(required_backend)) {
+        return;
+    }
+
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        ggml_tensor * node = gf->nodes[i];
+        if (!node || node->op == GGML_OP_NONE || tts_is_view_op(node->op)) {
+            continue;
+        }
+
+        ggml_backend_t actual_backend = ggml_backend_sched_get_tensor_backend(sched, node);
+        if (actual_backend == required_backend) {
+            continue;
+        }
+
+        TTS_ABORT("Strict backend graph '%s' placed node #%d op=%s name='%s' on %s instead of %s.\n",
+                  graph_name ? graph_name : "<unnamed>",
+                  i,
+                  ggml_op_name(node->op),
+                  ggml_get_name(node),
+                  actual_backend ? ggml_backend_name(actual_backend) : "<unassigned>",
+                  ggml_backend_name(required_backend));
+    }
+}
 
 void append_to_response(tts_response & response, tts_response & to_append) {
     float * new_data = (float *) malloc((response.n_outputs + to_append.n_outputs) * sizeof(float));
@@ -36,12 +247,6 @@ void runner_context::get_ggml_node_data(struct ggml_tensor * output_node, float 
 }
 
 void runner_context::set_threads() {
-    if (backend != nullptr) {
-#ifdef GGML_USE_METAL
-        // this is form copied from llama.cpp, but has since been removed. I don't know if this should be tuned.
-        ggml_backend_metal_set_n_cb(backend, 1);
-#endif
-    }
     if (backend_cpu != nullptr) {
         ggml_backend_cpu_set_n_threads(backend_cpu, n_threads);
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
@@ -53,9 +258,7 @@ void runner_context::set_threads() {
 void runner_context::build_schedule(size_t max_nodes) {
     backend_cpu_buffer = ggml_backend_cpu_buffer_type();
     if (backend != nullptr) {
-#ifdef GGML_USE_METAL
-        backend_buffer = ggml_backend_metal_buffer_type();
-#endif
+        backend_buffer = tts_backend_get_buffer_type(backend);
         std::vector<ggml_backend_buffer_type_t> bufs = {backend_buffer, backend_cpu_buffer};
         std::vector<ggml_backend_t> backs = {backend, backend_cpu};
         sched = ggml_backend_sched_new(backs.data(), bufs.data(), 2, max_nodes, false);
@@ -66,8 +269,21 @@ void runner_context::build_schedule(size_t max_nodes) {
     }
 }
 
+void runner_context::set_tensor_backend(ggml_tensor * tensor) {
+    if (backend && tensor) {
+        ggml_backend_sched_set_tensor_backend(sched, tensor, backend);
+    }
+}
+
 bool runner_context::prep_schedule(struct ggml_cgraph * gf) {
+    if (backend && !tts_backend_is_cpu(backend)) {
+        return true;
+    }
     return ggml_backend_sched_reserve(sched, gf);
+}
+
+void runner_context::alloc_graph(ggml_cgraph * gf, const char * graph_name) {
+    tts_backend_sched_alloc_graph_checked(sched, backend, gf, graph_name);
 }
 
 void runner_context::prep_output_buffer(size_t new_size) {
@@ -126,20 +342,13 @@ void test_tts_generation_runner::prepare_post_load() {
 }
 
 void tts_model::prep_buffers_and_context(bool cpu_only, float size_offset, uint32_t dedicated_add_on_size) {
-    // currently DAC is only supported on cpu because the ops are not implemented on other devices;
-    if (cpu_only) {
-        backend = ggml_backend_cpu_init();
-        buffer = ggml_backend_cpu_buffer_type();
-    } else {
-#ifdef GGML_USE_METAL
-        backend = ggml_backend_metal_init();
-        buffer = ggml_backend_metal_buffer_type();
-#endif
-        // if use metal is not installed then we need to warn here
-        if (!backend || !buffer) {
-            TTS_ABORT("'GGML_USE_METAL' is not defined either set the model to use CPU only or install ggml with metal support.");
-        }
+    backend = tts_backend_init_model(cpu_only);
+    buffer = tts_backend_get_buffer_type(backend);
+    if (!backend || !buffer) {
+        TTS_ABORT("Failed to initialize model backend. Set TTS_BACKEND=cpu to force CPU.\n");
     }
+    const size_t alignment = ggml_backend_buft_get_alignment(buffer);
+    const size_t max_alignment_padding = alignment > 0 ? (alignment - 1) * tensor_meta.n_tensors : 0;
     size_t ctx_size = ggml_tensor_overhead() * (tensor_meta.n_tensors * size_offset);
     struct ggml_init_params params = {
         /*.mem_size   =*/ ctx_size,
@@ -147,7 +356,7 @@ void tts_model::prep_buffers_and_context(bool cpu_only, float size_offset, uint3
         /*.no_alloc   =*/ true,
     };
     ctx = ggml_init(params);
-    buf = ggml_backend_buft_alloc_buffer(buffer, tensor_meta.n_bytes + dedicated_add_on_size);
+    buf = ggml_backend_buft_alloc_buffer(buffer, tensor_meta.n_bytes + max_alignment_padding + dedicated_add_on_size);
 }
 
 void tts_model::assign_weight(std::string name, ggml_tensor * tensor) {
@@ -155,10 +364,33 @@ void tts_model::assign_weight(std::string name, ggml_tensor * tensor) {
 }
 
 void tts_model::set_tensor(struct ggml_tensor * tensor, struct ggml_tensor * target) {
+    const size_t alignment = ggml_backend_buffer_get_alignment(buf);
+    offset = tts_pad_to_alignment(offset, alignment);
     tensor->buffer = buf;
     tensor->data = (void *)((uint8_t *) ggml_backend_buffer_get_base(buf) + offset);
     size_t size = ggml_nbytes(target);
+    if (offset + size > ggml_backend_buffer_get_size(buf)) {
+        TTS_ABORT("Model tensor buffer overflow while loading '%s': %zu + %zu > %zu\n",
+                  target->name, offset, size, ggml_backend_buffer_get_size(buf));
+    }
     ggml_backend_tensor_set(tensor, target->data, 0, size);
+    ggml_set_name(tensor, target->name);
+    offset += size;
+}
+
+void tts_model::set_tensor_from_backend_tensor(struct ggml_tensor * tensor, struct ggml_tensor * target) {
+    const size_t alignment = ggml_backend_buffer_get_alignment(buf);
+    offset = tts_pad_to_alignment(offset, alignment);
+    tensor->buffer = buf;
+    tensor->data = (void *)((uint8_t *) ggml_backend_buffer_get_base(buf) + offset);
+    size_t size = ggml_nbytes(target);
+    if (offset + size > ggml_backend_buffer_get_size(buf)) {
+        TTS_ABORT("Model tensor buffer overflow while storing '%s': %zu + %zu > %zu\n",
+                  target->name, offset, size, ggml_backend_buffer_get_size(buf));
+    }
+    std::vector<uint8_t> data(size);
+    ggml_backend_tensor_get(target, data.data(), 0, size);
+    ggml_backend_tensor_set(tensor, data.data(), 0, size);
     ggml_set_name(tensor, target->name);
     offset += size;
 }

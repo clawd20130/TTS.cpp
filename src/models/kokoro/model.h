@@ -230,6 +230,7 @@ struct kokoro_model : tts_model {
 	float voice_threshold = 10.0f;
 	float sample_rate = 24000.0f;
 	std::string window = "hann";
+	std::vector<float> generator_window_data;
 
 	// It is really annoying that ggml doesn't allow using non ggml tensors as the operator for simple math ops.
 	// This is just the constant defined above as a tensor.
@@ -393,16 +394,7 @@ struct kokoro_duration_runner : tts_runner {
 
 struct kokoro_context : runner_context {
     kokoro_context(kokoro_model * model, int n_threads): runner_context(n_threads), model(model) {};
-    ~kokoro_context() {
-        ggml_backend_sched_free(sched);
-        ggml_backend_free(backend_cpu);
-        if (backend) {
-            ggml_backend_free(backend);
-        }
-        if (buf_output) {
-            ggml_backend_buffer_free(buf_output);
-        }
-    }
+    ~kokoro_context() override = default;
 
     std::string voice = "af_alloy";
 
@@ -424,7 +416,7 @@ struct kokoro_context : runner_context {
 
 // TODO: now that we are passing the context down to these methods we should clean up their parameters
 static struct ggml_tensor * build_generator(ggml_context * ctx, kokoro_model * model, kokoro_context * kctx, struct ggml_tensor * x, struct ggml_tensor * style, struct ggml_tensor * f0_curve, kokoro_generator* generator, int sequence_length, struct ggml_tensor * window_sq_sum, ggml_cgraph * gf);
-static struct ggml_tensor * build_sin_gen(ggml_context * ctx, kokoro_model * model, kokoro_context * kctx, struct ggml_tensor * x, int harmonic_num, int sequence_length, float voice_threshold, float sin_amp, float noise_std);
+static struct ggml_tensor * build_sin_gen(ggml_context * ctx, kokoro_model * model, kokoro_context * kctx, struct ggml_tensor * x, int harmonic_num, int sequence_length);
 
 struct kokoro_context * build_new_kokoro_context(struct kokoro_model * model, int n_threads, bool use_cpu = true);
 

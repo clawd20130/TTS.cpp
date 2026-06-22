@@ -53,9 +53,6 @@ struct ggml_tensor * istft(ggml_context * ctx, struct ggml_tensor * a, struct gg
 // This is a custom op for sine_generation in the Kokoro model.
 void uv_noise_compute(struct ggml_tensor * dst, const struct ggml_tensor * a, const struct ggml_tensor * b, const struct ggml_tensor * c, int ith, int nth, void * userdata);
 
-// This is a custom op for logit correction in the Dia model.
-void cfg_scale(struct ggml_tensor * dst, const struct ggml_tensor * a, const struct ggml_tensor * b, int ith, int nth, void * userdata);
-
 struct ggml_tensor * reciprocal(ggml_context * ctx, struct ggml_tensor * x);
 
 bool has_suffix(std::string value, std::string suffix);

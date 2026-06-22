@@ -127,6 +127,7 @@ struct ggml_tensor * orpheus_build_layer_norm(ggml_context * ctx, struct ggml_te
 struct ggml_tensor * build_attn_mask(ggml_context * ctx, orpheus_context * octx, orpheus_ubatch & batch) {
     octx->attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) octx->current_position + batch.n_tokens, (int64_t) octx->current_position + batch.n_tokens);
     ggml_set_input(octx->attn_mask);
+    octx->set_tensor_backend(octx->attn_mask);
     return octx->attn_mask;
 }
 
@@ -138,11 +139,7 @@ struct ggml_tensor * build_attn_mask(ggml_context * ctx, orpheus_context * octx,
 
 orpheus_context * build_new_orpheus_context(orpheus_model * model, int n_threads, bool use_cpu) {
     orpheus_context * octx = new orpheus_context(model, n_threads);
-    if (!use_cpu) {
-#ifdef GGML_USE_METAL
-        octx->backend = ggml_backend_metal_init();
-#endif
-    }
+    octx->backend = tts_backend_init_accelerator(use_cpu);
     octx->backend_cpu = ggml_backend_cpu_init();
     octx->set_threads();
     octx->build_schedule();
@@ -153,9 +150,7 @@ orpheus_context * build_new_orpheus_context(orpheus_model * model, int n_threads
 void orpheus_runner::orpheus_kv_cache_init() {    
     ggml_backend_buffer_type_t buft = nullptr;
     if (octx->backend != nullptr) {
-#ifdef GGML_USE_METAL
-        buft = ggml_backend_metal_buffer_type();
-#endif
+        buft = tts_backend_get_buffer_type(octx->backend);
     } else {
         buft = ggml_backend_cpu_buffer_type();
     }
@@ -237,8 +232,10 @@ struct ggml_cgraph * orpheus_runner::build_orpheus_graph(orpheus_ubatch & batch)
     const int32_t full_sequence_length = octx->current_position + (uint32_t) batch.n_tokens;
     octx->positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.n_tokens);
     ggml_set_input(octx->positions);
+    octx->set_tensor_backend(octx->positions);
     octx->inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.n_tokens);
     ggml_set_input(octx->inp_tokens);
+    octx->set_tensor_backend(octx->inp_tokens);
     inpL = ggml_get_rows(ctx, model->embd, octx->inp_tokens);
     
     struct ggml_tensor * KQ_mask_dec = build_attn_mask(ctx, octx, batch);
@@ -323,7 +320,7 @@ void orpheus_runner::decode(orpheus_ubatch & batch) {
 
     // the output is always the last tensor in the graph
     struct ggml_tensor * res = gf->nodes[gf->n_nodes - 1];
-    ggml_backend_sched_alloc_graph(octx->sched, gf);
+    octx->alloc_graph(gf, "orpheus.decode");
     
     set_inputs(batch);
     ggml_backend_sched_graph_compute_async(octx->sched, gf);
@@ -341,15 +338,17 @@ void orpheus_runner::decode(orpheus_ubatch & batch) {
 
 void orpheus_runner::set_inputs(orpheus_ubatch & batch) {
     ggml_backend_tensor_set(octx->inp_tokens, batch.tokens.data(), 0, batch.tokens.size()*ggml_element_size(octx->inp_tokens));
-    int32_t * pos = (int32_t*) octx->positions->data;
-    float * mask = (float*) octx->attn_mask->data;
     uint32_t max_pos = octx->current_position + batch.n_tokens;
+    std::vector<int32_t> positions(batch.n_tokens);
+    std::vector<float> attn_mask((size_t) batch.n_tokens * max_pos);
     for (int i = 0; i < batch.n_tokens; i++) {
-        pos[i] = (int32_t) octx->current_position + i;
+        positions[i] = (int32_t) octx->current_position + i;
         for (int ii = 0; ii < max_pos; ii++) {
-            mask[i*max_pos + ii] = ii > pos[i] ? -INFINITY : 0.0f;
+            attn_mask[(size_t)i*max_pos + ii] = ii > positions[i] ? -INFINITY : 0.0f;
         }
     }
+    ggml_backend_tensor_set(octx->positions, positions.data(), 0, positions.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(octx->attn_mask, attn_mask.data(), 0, attn_mask.size() * sizeof(float));
 }
 
 orpheus_ubatch orpheus_runner::batch_from_sentence(std::string sentence) {
@@ -405,13 +404,18 @@ void orpheus_runner::generate_from_batch(orpheus_ubatch & batch, tts_response & 
 }
 
 void orpheus_runner::generate(const char * sentence, tts_response & response, const generation_configuration & config) {
+    const uint32_t previous_max_generation_size = model->max_generation_size;
     generation_sampler->temperature        = config.temperature;
     generation_sampler->repetition_penalty = config.repetition_penalty;
     generation_sampler->do_sample          = config.sample;
     generation_sampler->top_k              = config.top_k;
     generation_sampler->top_p              = config.top_p;
+    if (config.max_tokens > 0) {
+        model->max_generation_size = config.max_tokens;
+    }
     if (std::find(orpheus_voices.begin(), orpheus_voices.end(), config.voice) == orpheus_voices.end() &&
         !config.voice.empty()) {
+        model->max_generation_size = previous_max_generation_size;
         TTS_ABORT("Voice '%s' is not a valid voice for Orpheus.", config.voice.c_str());
     }
     octx->voice = config.voice;
@@ -428,6 +432,7 @@ void orpheus_runner::generate(const char * sentence, tts_response & response, co
         orpheus_kv_cache_init();
     }
     generate_from_batch(batch, response);
+    model->max_generation_size = previous_max_generation_size;
 }
 
 orpheus_ubatch orpheus_runner::build_worst_case_batch() {

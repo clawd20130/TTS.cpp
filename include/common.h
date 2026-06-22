@@ -52,7 +52,8 @@ struct generation_configuration {
     	std::string espeak_voice_id = "",
     	int max_tokens = 0,
     	float top_p = 1.0,
-    	bool sample = true): top_k(top_k), temperature(temperature), repetition_penalty(repetition_penalty), use_cross_attn(use_cross_attn), sample(sample), voice(voice), espeak_voice_id(espeak_voice_id), max_tokens(max_tokens), top_p(top_p) {};
+	    bool sample = true,
+	    bool input_phonemes = false): top_k(top_k), temperature(temperature), repetition_penalty(repetition_penalty), use_cross_attn(use_cross_attn), sample(sample), voice(voice), espeak_voice_id(espeak_voice_id), max_tokens(max_tokens), top_p(top_p), input_phonemes(input_phonemes) {};
 
     bool use_cross_attn;
     float temperature;
@@ -63,6 +64,7 @@ struct generation_configuration {
     std::string voice = "";
     bool sample = true;
     std::string espeak_voice_id = "";
+    bool input_phonemes = false;
 };
 
 struct tts_runner {

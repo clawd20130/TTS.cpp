@@ -1,8 +1,433 @@
 #include "model.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <cstdlib>
+#include <iostream>
+#include <map>
+#include <random>
+#include <string>
+#include <vector>
+
+static bool kokoro_debug_timings_enabled() {
+    const char * env = std::getenv("KOKORO_DEBUG_TIMINGS");
+    return env && env[0] && std::strcmp(env, "0") != 0;
+}
+
+static bool kokoro_debug_graph_ops_enabled() {
+    const char * env = std::getenv("KOKORO_DEBUG_GRAPH_OPS");
+    return env && env[0] && std::strcmp(env, "0") != 0;
+}
+
+static bool kokoro_debug_graph_shapes_enabled() {
+    const char * env = std::getenv("KOKORO_DEBUG_GRAPH_SHAPES");
+    return env && env[0] && std::strcmp(env, "0") != 0;
+}
+
+static bool kokoro_debug_generator_layout_enabled() {
+    const char * env = std::getenv("KOKORO_DEBUG_GENERATOR_LAYOUT");
+    return env && env[0] && std::strcmp(env, "0") != 0;
+}
+
+static bool kokoro_fuse_lstm_gates_enabled() {
+    const char * env = std::getenv("KOKORO_FUSE_LSTM_GATES");
+    return !env || !env[0] || std::strcmp(env, "0") != 0;
+}
+
+static bool kokoro_fuse_lstm_scan_enabled() {
+    const char * env = std::getenv("KOKORO_FUSE_LSTM_SCAN");
+    return env && env[0] && std::strcmp(env, "0") != 0;
+}
+
+static bool kokoro_fuse_conv1d_enabled() {
+    const char * env = std::getenv("KOKORO_FUSE_CONV1D");
+    return env && env[0] && std::strcmp(env, "0") != 0;
+}
+
+static bool kokoro_fuse_snake_enabled() {
+    const char * env = std::getenv("KOKORO_FUSE_SNAKE");
+    return env && env[0] && std::strcmp(env, "0") != 0;
+}
+
+static bool kokoro_fuse_adain_snake_enabled() {
+    const char * env = std::getenv("KOKORO_FUSE_ADAIN_SNAKE");
+    return env && env[0] && std::strcmp(env, "0") != 0;
+}
+
+static bool kokoro_debug_lstm_stats_enabled() {
+    const char * env = std::getenv("KOKORO_DEBUG_LSTM_STATS");
+    return env && env[0] && std::strcmp(env, "0") != 0;
+}
+
+static double kokoro_elapsed_ms(std::chrono::steady_clock::time_point start,
+                                std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+static int kokoro_debug_generator_layout_depth = 0;
+
+struct kokoro_debug_generator_layout_scope {
+    kokoro_debug_generator_layout_scope() {
+        kokoro_debug_generator_layout_depth += 1;
+    }
+
+    ~kokoro_debug_generator_layout_scope() {
+        kokoro_debug_generator_layout_depth -= 1;
+    }
+};
+
+static std::string kokoro_debug_shape(const ggml_tensor * tensor) {
+    if (!tensor) {
+        return "[]";
+    }
+    return "[" + std::to_string(tensor->ne[0]) +
+        "," + std::to_string(tensor->ne[1]) +
+        "," + std::to_string(tensor->ne[2]) +
+        "," + std::to_string(tensor->ne[3]) + "]";
+}
+
+static std::string kokoro_debug_stride(const ggml_tensor * tensor) {
+    if (!tensor) {
+        return "[]";
+    }
+    return "[" + std::to_string(tensor->nb[0]) +
+        "," + std::to_string(tensor->nb[1]) +
+        "," + std::to_string(tensor->nb[2]) +
+        "," + std::to_string(tensor->nb[3]) + "]";
+}
+
+static void kokoro_debug_print_layout(const std::string & label, const ggml_tensor * tensor) {
+    if (!kokoro_debug_generator_layout_enabled() || kokoro_debug_generator_layout_depth <= 0) {
+        return;
+    }
+    if (!tensor) {
+        std::cerr << "KOKORO_GENERATOR_LAYOUT label=" << label << " tensor=null" << std::endl;
+        return;
+    }
+
+    const char * name = ggml_get_name(tensor);
+    std::cerr << "KOKORO_GENERATOR_LAYOUT"
+              << " label=" << label
+              << " name=" << (name ? name : "")
+              << " op=" << ggml_op_name(tensor->op)
+              << " shape=" << kokoro_debug_shape(tensor)
+              << " stride_bytes=" << kokoro_debug_stride(tensor)
+              << " elem_size=" << ggml_element_size(tensor)
+              << " contiguous=" << (ggml_is_contiguous(tensor) ? 1 : 0)
+              << " transposed=" << (ggml_is_transposed(tensor) ? 1 : 0)
+              << " view=" << (tensor->view_src ? 1 : 0)
+              << std::endl;
+}
+
+static ggml_tensor * kokoro_conv_1d(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input, int s0, int p0, int d0) {
+    kokoro_debug_print_layout("conv1d.weight", weight);
+    kokoro_debug_print_layout("conv1d.input", input);
+    ggml_tensor * result;
+    if (kokoro_fuse_conv1d_enabled()) {
+        result = ggml_kokoro_conv_1d(ctx, weight, input, s0, p0, d0);
+    } else {
+        result = ggml_conv_1d(ctx, weight, input, s0, p0, d0);
+    }
+    kokoro_debug_print_layout("conv1d.output", result);
+    return result;
+}
+
+static ggml_tensor * kokoro_snake_1d_t(ggml_context * ctx, ggml_tensor * alpha, ggml_tensor * input_channels_time) {
+    kokoro_debug_print_layout("snake_t.alpha", alpha);
+    kokoro_debug_print_layout("snake_t.input_channels_time", input_channels_time);
+    ggml_tensor * result;
+    if (kokoro_fuse_snake_enabled()) {
+        result = ggml_kokoro_snake_1d_t(ctx, alpha, input_channels_time);
+    } else {
+        result = snake_1d(ctx, alpha, ggml_cont(ctx, ggml_transpose(ctx, input_channels_time)));
+    }
+    kokoro_debug_print_layout("snake_t.output", result);
+    return result;
+}
+
+static ggml_tensor * kokoro_adain_snake_1d_t(ggml_context * ctx, ggml_tensor * alpha, ggml_tensor * input_channels_time, ggml_tensor * gamma, ggml_tensor * beta) {
+    kokoro_debug_print_layout("adain_snake_t.alpha", alpha);
+    kokoro_debug_print_layout("adain_snake_t.input_channels_time", input_channels_time);
+    kokoro_debug_print_layout("adain_snake_t.gamma", gamma);
+    kokoro_debug_print_layout("adain_snake_t.beta", beta);
+    ggml_tensor * result = ggml_kokoro_adain_snake_1d_t(ctx, alpha, input_channels_time, gamma, beta);
+    kokoro_debug_print_layout("adain_snake_t.output", result);
+    return result;
+}
+
+static bool kokoro_debug_shape_op(const ggml_tensor * node) {
+    if (!node) {
+        return false;
+    }
+    switch (node->op) {
+        case GGML_OP_KOKORO_CONV_1D:
+        case GGML_OP_KOKORO_SNAKE_1D_T:
+        case GGML_OP_KOKORO_ADAIN_SNAKE_1D_T:
+        case GGML_OP_CONV_TRANSPOSE_1D:
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_CONT:
+        case GGML_OP_TRANSPOSE:
+        case GGML_OP_NORM:
+        case GGML_OP_LEAKY_RELU:
+        case GGML_OP_CONCAT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static std::string kokoro_debug_shape_key(const ggml_tensor * node) {
+    std::string key = ggml_op_name(node->op);
+    key += " out=";
+    key += kokoro_debug_shape(node);
+
+    if (node->op == GGML_OP_KOKORO_CONV_1D) {
+        key += " w=";
+        key += kokoro_debug_shape(node->src[0]);
+        key += " x=";
+        key += kokoro_debug_shape(node->src[1]);
+        key += " s=" + std::to_string(ggml_get_op_params_i32(node, 0));
+        key += " p=" + std::to_string(ggml_get_op_params_i32(node, 1));
+        key += " d=" + std::to_string(ggml_get_op_params_i32(node, 2));
+        return key;
+    }
+
+    if (node->op == GGML_OP_CONV_TRANSPOSE_1D) {
+        key += " w=";
+        key += kokoro_debug_shape(node->src[0]);
+        key += " x=";
+        key += kokoro_debug_shape(node->src[1]);
+        key += " s=" + std::to_string(ggml_get_op_params_i32(node, 0));
+        key += " p=" + std::to_string(ggml_get_op_params_i32(node, 1));
+        key += " d=" + std::to_string(ggml_get_op_params_i32(node, 2));
+        key += " g=" + std::to_string(ggml_get_op_params_i32(node, 3));
+        return key;
+    }
+
+    if (node->src[0]) {
+        key += " a=";
+        key += kokoro_debug_shape(node->src[0]);
+    }
+    if (node->src[1]) {
+        key += " b=";
+        key += kokoro_debug_shape(node->src[1]);
+    }
+    return key;
+}
+
+static void kokoro_debug_print_graph_ops(const char * phase, const ggml_cgraph * gf) {
+    if (!kokoro_debug_graph_ops_enabled() || !gf) {
+        return;
+    }
+    std::map<std::string, int> counts;
+    std::map<std::string, int> shapes;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const ggml_tensor * node = gf->nodes[i];
+        if (!node) {
+            continue;
+        }
+        std::string name = ggml_op_name(node->op);
+        if (node->op == GGML_OP_UNARY) {
+            name += ":";
+            name += ggml_unary_op_name(ggml_get_unary_op(node));
+        }
+        counts[name] += 1;
+        if (kokoro_debug_graph_shapes_enabled() && kokoro_debug_shape_op(node)) {
+            shapes[kokoro_debug_shape_key(node)] += 1;
+        }
+    }
+    std::vector<std::pair<std::string, int>> sorted(counts.begin(), counts.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto & lhs, const auto & rhs) {
+        if (lhs.second != rhs.second) {
+            return lhs.second > rhs.second;
+        }
+        return lhs.first < rhs.first;
+    });
+    std::cerr << "KOKORO_GRAPH_OPS phase=" << phase << " nodes=" << gf->n_nodes;
+    const size_t limit = std::min<size_t>(sorted.size(), 24);
+    for (size_t i = 0; i < limit; ++i) {
+        std::cerr << " " << sorted[i].first << "=" << sorted[i].second;
+    }
+    std::cerr << std::endl;
+
+    if (!shapes.empty()) {
+        std::vector<std::pair<std::string, int>> sorted_shapes(shapes.begin(), shapes.end());
+        std::sort(sorted_shapes.begin(), sorted_shapes.end(), [](const auto & lhs, const auto & rhs) {
+            if (lhs.second != rhs.second) {
+                return lhs.second > rhs.second;
+            }
+            return lhs.first < rhs.first;
+        });
+        const size_t shape_limit = std::min<size_t>(sorted_shapes.size(), 40);
+        for (size_t i = 0; i < shape_limit; ++i) {
+            std::cerr << "KOKORO_GRAPH_SHAPE phase=" << phase
+                      << " count=" << sorted_shapes[i].second
+                      << " " << sorted_shapes[i].first
+                      << std::endl;
+        }
+    }
+}
+
+static std::string kokoro_debug_op_counts(const ggml_cgraph * gf, int begin, int end, size_t limit) {
+    if (!gf) {
+        return "";
+    }
+    begin = std::max(0, begin);
+    end = std::min(end, gf->n_nodes);
+    if (begin >= end) {
+        return "";
+    }
+    std::map<std::string, int> counts;
+    for (int i = begin; i < end; ++i) {
+        const ggml_tensor * node = gf->nodes[i];
+        if (!node) {
+            continue;
+        }
+        std::string name = ggml_op_name(node->op);
+        if (node->op == GGML_OP_UNARY) {
+            name += ":";
+            name += ggml_unary_op_name(ggml_get_unary_op(node));
+        }
+        counts[name] += 1;
+    }
+    std::vector<std::pair<std::string, int>> sorted(counts.begin(), counts.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto & lhs, const auto & rhs) {
+        if (lhs.second != rhs.second) {
+            return lhs.second > rhs.second;
+        }
+        return lhs.first < rhs.first;
+    });
+    std::string result;
+    const size_t n = std::min(limit, sorted.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (!result.empty()) {
+            result += ",";
+        }
+        result += sorted[i].first;
+        result += "=";
+        result += std::to_string(sorted[i].second);
+    }
+    return result;
+}
+
+static ggml_tensor * kokoro_find_graph_node(ggml_cgraph * gf, const char * name) {
+    if (!gf || !name) {
+        return nullptr;
+    }
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        ggml_tensor * node = gf->nodes[i];
+        if (node && std::strcmp(ggml_get_name(node), name) == 0) {
+            return node;
+        }
+    }
+    return nullptr;
+}
+
+static std::vector<std::string> kokoro_debug_split_csv(const char * value) {
+    std::vector<std::string> parts;
+    if (!value || !value[0]) {
+        return parts;
+    }
+    std::string text(value);
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t comma = text.find(',', start);
+        const size_t end = comma == std::string::npos ? text.size() : comma;
+        std::string part = strip(text.substr(start, end - start));
+        if (!part.empty()) {
+            parts.push_back(part);
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return parts;
+}
+
+static bool kokoro_debug_name_enabled(const std::vector<std::string> & names, const char * node_name) {
+    if (!node_name || !node_name[0]) {
+        return false;
+    }
+    return std::find(names.begin(), names.end(), node_name) != names.end();
+}
+
+static void kokoro_debug_print_tensor_stats(runner_context * kctx, const char * tag, int idx, ggml_tensor * node) {
+    if (!kctx || !node || node->type != GGML_TYPE_F32) {
+        return;
+    }
+    const size_t nbytes = ggml_nbytes(node);
+    std::vector<float> values(nbytes / sizeof(float));
+    ggml_backend_buffer_t tmp_buffer = ggml_backend_buft_alloc_buffer(kctx->backend_cpu_buffer, nbytes);
+    kctx->get_ggml_node_data(node, values.data(), nbytes, tmp_buffer);
+    ggml_backend_buffer_free(tmp_buffer);
+
+    float min_value = INFINITY;
+    float max_value = -INFINITY;
+    double sum_value = 0.0;
+    double sq_sum_value = 0.0;
+    size_t nan_count = 0;
+    for (float value : values) {
+        if (std::isnan(value) || std::isinf(value)) {
+            nan_count += 1;
+            continue;
+        }
+        min_value = std::min(min_value, value);
+        max_value = std::max(max_value, value);
+        sum_value += value;
+        sq_sum_value += (double)value * (double)value;
+    }
+    const double denom = values.empty() ? 1.0 : (double)values.size();
+    std::cerr << tag
+              << " idx=" << idx
+              << " op=" << ggml_op_name(node->op)
+              << " name=" << node->name
+              << " ne=[" << node->ne[0] << "," << node->ne[1] << "," << node->ne[2] << "," << node->ne[3] << "]"
+              << " min=" << (values.empty() ? 0.0f : min_value)
+              << " max=" << (values.empty() ? 0.0f : max_value)
+              << " mean=" << (sum_value / denom)
+              << " rms=" << std::sqrt(sq_sum_value / denom)
+              << " bad=" << nan_count
+              << " first=";
+    const size_t preview = std::min<size_t>(values.size(), 8);
+    for (size_t j = 0; j < preview; ++j) {
+        if (j > 0) {
+            std::cerr << ",";
+        }
+        std::cerr << values[j];
+    }
+    std::cerr << std::endl;
+}
+
+static bool kokoro_debug_fill_seeded_uv_noise(std::vector<float> & uv_noise, size_t offset) {
+    const char * seed_env = std::getenv("KOKORO_DEBUG_UV_NOISE_SEED");
+    if (!seed_env || !seed_env[0]) {
+        return false;
+    }
+    char * end = nullptr;
+    const unsigned long seed = std::strtoul(seed_env, &end, 10);
+    if (end == seed_env) {
+        return false;
+    }
+    std::minstd_rand gen((uint32_t)seed);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    for (size_t i = offset; i < uv_noise.size(); ++i) {
+        uv_noise[i] = dist(gen);
+    }
+    return true;
+}
+
+static bool backend_is_vulkan(ggml_backend_t backend) {
+    const char * name = backend ? ggml_backend_name(backend) : nullptr;
+    return name && std::strncmp(name, "Vulkan", 6) == 0;
+}
+
 static struct ggml_tensor * build_albert_attn_mask(ggml_context * ctx, struct kokoro_duration_context *kctx, const kokoro_ubatch & batch) {
     kctx->attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) batch.n_tokens, (int64_t) batch.n_tokens);
     ggml_set_input(kctx->attn_mask);
+    kctx->set_tensor_backend(kctx->attn_mask);
 
     return kctx->attn_mask;
 }
@@ -31,22 +456,59 @@ static struct ggml_tensor * build_albert_norm(ggml_context * ctx, ggml_tensor * 
 }
 
 static struct ggml_tensor * build_lstm_run(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * input, ggml_tensor * h_0, ggml_tensor * c_0, std::vector<ggml_tensor*> weights, std::vector<ggml_tensor*> biases, uint32_t sequence_length, bool reversed = false);
+static struct ggml_tensor * build_lstm_run_fused(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * input, ggml_tensor * h_0, ggml_tensor * c_0, std::vector<ggml_tensor*> weights, std::vector<ggml_tensor*> biases, uint32_t sequence_length, bool reversed = false);
 
 static struct ggml_tensor * build_lstm(ggml_context * ctx, ggml_tensor * input, lstm* rnn, uint32_t sequence_length, ggml_cgraph * gf) {
 	struct ggml_tensor * resp = input;
 	struct ggml_tensor * reverse_resp = input;
+    const bool debug_lstm_stats = kokoro_debug_lstm_stats_enabled();
+    int lstm_node_count_before = gf ? gf->n_nodes : 0;
+    const int64_t input_width = input ? input->ne[0] : 0;
+    const int64_t input_length = input ? input->ne[1] : 0;
+    const int64_t hidden_size = (!rnn->cells.empty() && !rnn->cells[0]->biases.empty() && rnn->cells[0]->biases[0])
+        ? rnn->cells[0]->biases[0]->ne[0]
+        : 0;
 
 	// iterate over cells first so that at each pass to the next cell we have a fully formed vector (this improves performance as well as allocation for stacked lstms)
 	for (int c = 0; c < rnn->cells.size(); c++) {
 		ggml_build_forward_expand(gf, resp);
-		resp = build_lstm_run(ctx, gf, resp, rnn->hidden[c], rnn->states[c], rnn->cells[c]->weights, rnn->cells[c]->biases, sequence_length);
+        if (debug_lstm_stats && c == 0) {
+            lstm_node_count_before = gf ? gf->n_nodes : 0;
+        }
+        const bool fuse_gates = kokoro_fuse_lstm_gates_enabled() || kokoro_fuse_lstm_scan_enabled();
+		resp = fuse_gates
+            ? build_lstm_run_fused(ctx, gf, resp, rnn->hidden[c], rnn->states[c], rnn->cells[c]->weights, rnn->cells[c]->biases, sequence_length)
+            : build_lstm_run(ctx, gf, resp, rnn->hidden[c], rnn->states[c], rnn->cells[c]->weights, rnn->cells[c]->biases, sequence_length);
 		if (rnn->bidirectional) {
-			reverse_resp = build_lstm_run(ctx, gf, reverse_resp, rnn->hidden[c], rnn->states[c], rnn->cells[c]->reverse_weights, rnn->cells[c]->reverse_biases, sequence_length, true);
+			reverse_resp = fuse_gates
+                ? build_lstm_run_fused(ctx, gf, reverse_resp, rnn->hidden[c], rnn->states[c], rnn->cells[c]->reverse_weights, rnn->cells[c]->reverse_biases, sequence_length, true)
+                : build_lstm_run(ctx, gf, reverse_resp, rnn->hidden[c], rnn->states[c], rnn->cells[c]->reverse_weights, rnn->cells[c]->reverse_biases, sequence_length, true);
 		}
 	}
 	if (rnn->bidirectional) {
 		resp = ggml_concat(ctx, resp, reverse_resp, 0);
 	}
+    if (debug_lstm_stats) {
+        ggml_build_forward_expand(gf, resp);
+        const int node_count_after = gf ? gf->n_nodes : lstm_node_count_before;
+        const char * weight_name = (!rnn->cells.empty() && !rnn->cells[0]->weights.empty() && rnn->cells[0]->weights[0])
+            ? ggml_get_name(rnn->cells[0]->weights[0])
+            : "";
+        std::cerr << "KOKORO_LSTM_STATS"
+                  << " weight=" << weight_name
+                  << " seq=" << sequence_length
+                  << " input_ne0=" << input_width
+                  << " input_ne1=" << input_length
+                  << " hidden=" << hidden_size
+                  << " cells=" << rnn->cells.size()
+                  << " bidirectional=" << (rnn->bidirectional ? 1 : 0)
+                  << " node_delta=" << (node_count_after - lstm_node_count_before)
+                  << " nodes_after=" << node_count_after
+                  << " fused_gates=" << (kokoro_fuse_lstm_gates_enabled() ? 1 : 0)
+                  << " fused_scan=" << (kokoro_fuse_lstm_scan_enabled() ? 1 : 0)
+                  << " ops=" << kokoro_debug_op_counts(gf, lstm_node_count_before, node_count_after, 12)
+                  << std::endl;
+    }
 	return resp;
 }
 
@@ -85,6 +547,69 @@ static struct ggml_tensor * build_lstm_run(ggml_context * ctx, ggml_cgraph * gf,
 	return outputs;
 }
 
+static struct ggml_tensor * lstm_concat4(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b, ggml_tensor * c, ggml_tensor * d, int dim) {
+    return ggml_concat(ctx, ggml_concat(ctx, a, b, dim), ggml_concat(ctx, c, d, dim), dim);
+}
+
+static struct ggml_tensor * lstm_gate_view(ggml_context * ctx, ggml_tensor * gates, int gate, int64_t hidden_size, int64_t time_index = -1) {
+    const size_t gate_offset = (size_t)gate * (size_t)hidden_size * gates->nb[0];
+    if (time_index >= 0) {
+        return ggml_view_3d(ctx,
+                            gates,
+                            hidden_size,
+                            1,
+                            gates->ne[2],
+                            gates->nb[0],
+                            gates->nb[1],
+                            gates->nb[1] * time_index + gate_offset);
+    }
+    return ggml_view_3d(ctx,
+                        gates,
+                        hidden_size,
+                        gates->ne[1],
+                        gates->ne[2],
+                        gates->nb[0],
+                        gates->nb[1],
+                        gate_offset);
+}
+
+static struct ggml_tensor * build_lstm_run_fused(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * input, ggml_tensor * h_0, ggml_tensor * c_0, std::vector<ggml_tensor*> weights, std::vector<ggml_tensor*> biases, uint32_t sequence_length, bool reversed) {
+    const int64_t hidden_size = biases[0]->ne[0];
+    struct ggml_tensor * input_weights = lstm_concat4(ctx, weights[0], weights[2], weights[4], weights[6], 1);
+    struct ggml_tensor * input_biases = lstm_concat4(ctx, biases[0], biases[2], biases[4], biases[6], 0);
+    struct ggml_tensor * recurrent_weights = lstm_concat4(ctx, weights[1], weights[3], weights[5], weights[7], 1);
+    struct ggml_tensor * recurrent_biases = lstm_concat4(ctx, biases[1], biases[3], biases[5], biases[7], 0);
+
+	struct ggml_tensor * input_gates = ggml_add(ctx, ggml_mul_mat(ctx, input_weights, input), input_biases);
+
+    if (kokoro_fuse_lstm_scan_enabled()) {
+        return ggml_kokoro_lstm_scan(ctx, input_gates, recurrent_weights, recurrent_biases, h_0, c_0, reversed);
+    }
+
+	struct ggml_tensor * outputs;
+
+	for (int index = 0; index < sequence_length; index++) {
+		int i = reversed ? sequence_length - 1 - index : index;
+        struct ggml_tensor * recurrent_gates = ggml_add(ctx, ggml_mul_mat(ctx, recurrent_weights, h_0), recurrent_biases);
+
+		struct ggml_tensor * I_cur = ggml_sigmoid(ctx, ggml_add(ctx, lstm_gate_view(ctx, input_gates, 0, hidden_size, i), lstm_gate_view(ctx, recurrent_gates, 0, hidden_size)));
+		struct ggml_tensor * F_cur = ggml_sigmoid(ctx, ggml_add(ctx, lstm_gate_view(ctx, input_gates, 1, hidden_size, i), lstm_gate_view(ctx, recurrent_gates, 1, hidden_size)));
+		struct ggml_tensor * G_cur = ggml_tanh(ctx, ggml_add(ctx, lstm_gate_view(ctx, input_gates, 2, hidden_size, i), lstm_gate_view(ctx, recurrent_gates, 2, hidden_size)));
+		struct ggml_tensor * O_cur = ggml_sigmoid(ctx, ggml_add(ctx, lstm_gate_view(ctx, input_gates, 3, hidden_size, i), lstm_gate_view(ctx, recurrent_gates, 3, hidden_size)));
+
+		c_0 = ggml_add(ctx, ggml_mul(ctx, F_cur, c_0), ggml_mul(ctx, I_cur, G_cur));
+		h_0 = ggml_mul(ctx, ggml_tanh(ctx, c_0), O_cur);
+
+		if (index == 0) {
+			outputs = h_0;
+		} else {
+			outputs = reversed ? ggml_concat(ctx, h_0, outputs, 1) : ggml_concat(ctx, outputs, h_0, 1);
+		}
+		ggml_build_forward_expand(gf, outputs);
+	}
+	return outputs;
+}
+
 static struct ggml_tensor * build_ada_residual_conv(ggml_context * ctx, struct ggml_tensor * x, ada_residual_conv_block * block, struct ggml_tensor * style, struct ggml_tensor * sqrt_tensor) {
 	struct ggml_tensor * cur = x;
 	struct ggml_tensor * gamma;
@@ -105,7 +630,7 @@ static struct ggml_tensor * build_ada_residual_conv(ggml_context * ctx, struct g
 		cur = ggml_add(ctx, cur, block->pool_bias);
 	}
 
- 	cur = ggml_conv_1d(ctx, block->conv1, cur, 1, 1, 1);
+	cur = kokoro_conv_1d(ctx, block->conv1, cur, 1, 1, 1);
 
 	cur   = ggml_add(ctx, cur, block->conv1_bias);
 	gamma = ggml_add(ctx, ggml_mul_mat(ctx, block->norm2_gamma, style), block->norm2_gamma_bias);
@@ -117,7 +642,7 @@ static struct ggml_tensor * build_ada_residual_conv(ggml_context * ctx, struct g
 	cur = ggml_add(ctx, cur, ggml_mul(ctx, cur, ggml_transpose(ctx, gamma)));
 	cur = ggml_add(ctx, cur, ggml_transpose(ctx, beta));
 	cur = ggml_leaky_relu(ctx, cur, 0.2f, false);
-	cur = ggml_add(ctx, ggml_conv_1d(ctx, block->conv2, cur, 1, 1, 1), block->conv2_bias);
+	cur = ggml_add(ctx, kokoro_conv_1d(ctx, block->conv2, cur, 1, 1, 1), block->conv2_bias);
 
 	struct ggml_tensor * res = cur;
 	cur = x;
@@ -138,65 +663,96 @@ static struct ggml_tensor * build_kokoro_generator_res_block(ggml_context * ctx,
 	struct ggml_tensor * gamma;
 	struct ggml_tensor * beta;
 	struct ggml_tensor * inpl = x;
+    kokoro_debug_print_layout("gen_res.entry", x);
 	for (int i = 0; i < block->convs1_weights.size(); i++) {
+        const std::string prefix = "gen_res.layer." + std::to_string(i);
 		gamma = ggml_add(ctx, ggml_mul_mat(ctx, block->adain1d_1_gamma_weights[i], style), block->adain1d_1_gamma_biases[i]);
 		beta  = ggml_add(ctx, ggml_mul_mat(ctx, block->adain1d_1_beta_weights[i], style), block->adain1d_1_beta_biases[i]);
 		cur   = ggml_cont(ctx, ggml_transpose(ctx, ggml_norm(ctx, inpl, 0.00001)));
+        kokoro_debug_print_layout(prefix + ".norm1_transpose_cont", cur);
 
 		// The addition between gamma * x and x is performed here because ggml doesn't support scalar multiplication without initializing the scalars in advance.
 		// An optimal remedy to this would be to increment the gamma bias above by one when preparing the gguf file for the model.
-		cur   = ggml_add(ctx, ggml_add(ctx, cur, ggml_mul(ctx, cur, gamma)), beta);
-		cur   = snake_1d(ctx, block->input_alphas[i], ggml_cont(ctx, ggml_transpose(ctx, cur)));
+        if (kokoro_fuse_adain_snake_enabled()) {
+            cur = kokoro_adain_snake_1d_t(ctx, block->input_alphas[i], cur, gamma, beta);
+            kokoro_debug_print_layout(prefix + ".adain_snake1", cur);
+        } else {
+		    cur   = ggml_add(ctx, ggml_add(ctx, cur, ggml_mul(ctx, cur, gamma)), beta);
+            kokoro_debug_print_layout(prefix + ".adain1", cur);
+		    cur   = kokoro_snake_1d_t(ctx, block->input_alphas[i], cur);
+        }
+        kokoro_debug_print_layout(prefix + ".snake1", cur);
 
-		cur   = ggml_add(ctx, ggml_conv_1d(ctx, block->convs1_weights[i], cur, 1, block->conv1_paddings[i], block->conv1_dilations[i]), block->convs1_biases[i]);
+		cur   = ggml_add(ctx, kokoro_conv_1d(ctx, block->convs1_weights[i], cur, 1, block->conv1_paddings[i], block->conv1_dilations[i]), block->convs1_biases[i]);
+        kokoro_debug_print_layout(prefix + ".conv1_add_bias", cur);
 		gamma = ggml_add(ctx, ggml_mul_mat(ctx, block->adain1d_2_gamma_weights[i], style), block->adain1d_2_gamma_biases[i]);
 		beta  = ggml_add(ctx, ggml_mul_mat(ctx, block->adain1d_2_beta_weights[i], style), block->adain1d_2_beta_biases[i]);
 		cur   = ggml_cont(ctx, ggml_transpose(ctx, ggml_norm(ctx, cur, 0.00001)));
+        kokoro_debug_print_layout(prefix + ".norm2_transpose_cont", cur);
 
 		// The addition between gamma * x and x is performed here because ggml doesn't support scalar multiplication without initializing the scalars in advance.
 		// An optimal remedy to this would be to increment the gamma bias above by one when preparing the gguf file for the model.
-		cur   = ggml_cont(ctx, ggml_transpose(ctx, ggml_add(ctx, ggml_add(ctx, cur, ggml_mul(ctx, cur, gamma)), beta)));
-
-		cur   = snake_1d(ctx, block->output_alphas[i], cur);
-		cur   = ggml_add(ctx, ggml_conv_1d(ctx, block->convs2_weights[i], cur, 1, block->conv1_paddings[0], 1), block->convs2_biases[i]);
+        if (kokoro_fuse_adain_snake_enabled()) {
+		    cur = kokoro_adain_snake_1d_t(ctx, block->output_alphas[i], cur, gamma, beta);
+            kokoro_debug_print_layout(prefix + ".adain_snake2", cur);
+        } else {
+		    cur = kokoro_snake_1d_t(ctx, block->output_alphas[i], ggml_add(ctx, ggml_add(ctx, cur, ggml_mul(ctx, cur, gamma)), beta));
+        }
+        kokoro_debug_print_layout(prefix + ".snake2", cur);
+		cur   = ggml_add(ctx, kokoro_conv_1d(ctx, block->convs2_weights[i], cur, 1, block->conv1_paddings[0], 1), block->convs2_biases[i]);
+        kokoro_debug_print_layout(prefix + ".conv2_add_bias", cur);
 		inpl   = ggml_add(ctx, inpl, cur);
+        kokoro_debug_print_layout(prefix + ".residual_add", inpl);
 	}
 	return inpl;
 }
 
 static struct ggml_tensor * build_noise_block(ggml_context * ctx, kokoro_noise_residual_block * block, struct ggml_tensor * x, struct ggml_tensor * style) {
 	// This conv_1d seems replaceable with squeezed and transposed ggml_mul_mut, but s0 and p0 are dynamic
-	ggml_tensor * cur = ggml_add(ctx, ggml_conv_1d(ctx, block->input_conv, x, block->input_conv_stride, block->input_conv_padding, 1), block->input_conv_bias);
+	ggml_tensor * cur = ggml_add(ctx, kokoro_conv_1d(ctx, block->input_conv, x, block->input_conv_stride, block->input_conv_padding, 1), block->input_conv_bias);
 	return build_kokoro_generator_res_block(ctx, cur, style, block->res_block);
 }
 
-static struct ggml_tensor * build_sin_gen(ggml_context * ctx, kokoro_model * model, kokoro_context * kctx, struct ggml_tensor * x, int harmonic_num, int sequence_length, float voice_threshold, float sin_amp, float noise_std) {
+static struct ggml_tensor * build_sin_gen(ggml_context * ctx, kokoro_model * model, kokoro_context * kctx, struct ggml_tensor * x, int harmonic_num, int sequence_length) {
 	struct ggml_tensor * cur = ggml_mul(ctx, ggml_repeat(ctx, x, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], harmonic_num)), model->harmonic_sampling_norm);
 	cur = ggml_mul(ctx, ggml_cumsum(ctx, ggml_mod(ctx, cur, 1.0f)), model->sampling_factor_scalar);
 	cur = ggml_upscale_linear(ctx, cur, 300);
 	struct ggml_tensor * upscaled = ggml_upscale_ext(ctx, x, x->ne[0]*300, x->ne[1], x->ne[2], x->ne[3]);
 
-	kctx->uv_noise_data = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sequence_length*harmonic_num+4);
+	kctx->uv_noise_data = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, sequence_length*harmonic_num+4);
 	ggml_set_input(kctx->uv_noise_data);
+	kctx->set_tensor_backend(kctx->uv_noise_data);
 
-    struct ggml_tensor * fake = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, sequence_length, harmonic_num, 2);
+	struct ggml_tensor * neg_voice_threshold = ggml_view_1d(ctx, kctx->uv_noise_data, 1, 0);
+	struct ggml_tensor * noise_delta = ggml_view_1d(ctx, kctx->uv_noise_data, 1, sizeof(float));
+	struct ggml_tensor * sin_amp_t = ggml_view_1d(ctx, kctx->uv_noise_data, 1, 2*sizeof(float));
+	struct ggml_tensor * sin_amp_div_t = ggml_view_1d(ctx, kctx->uv_noise_data, 1, 3*sizeof(float));
+	struct ggml_tensor * rand_init = ggml_view_2d(ctx, kctx->uv_noise_data, sequence_length, harmonic_num, sequence_length*sizeof(float), 4*sizeof(float));
 
-    // ggml doesn't support boolean tensors nor does it support greater than and roll ops. As a result, we represent these boolean tensors as 1.0 or 0.0 or simply perform
-    // multiplications in place via a custom map.
-    struct ggml_tensor * uv_noise = ggml_map_custom3(ctx, fake, upscaled, kctx->uv_noise_data, &uv_noise_compute, sequence_length, nullptr);
-
-
-    struct ggml_tensor * noise = ggml_cont(ctx, ggml_view_2d(ctx, uv_noise, uv_noise->ne[0], uv_noise->ne[1], uv_noise->nb[1], uv_noise->nb[2]));
-    struct ggml_tensor * uv = ggml_cont(ctx, ggml_view_2d(ctx, uv_noise, uv_noise->ne[0], uv_noise->ne[1], uv_noise->nb[1], 0));
+	struct ggml_tensor * harmonic_target = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sequence_length, harmonic_num);
+	struct ggml_tensor * voiced = ggml_repeat(ctx, ggml_step(ctx, ggml_add(ctx, upscaled, neg_voice_threshold)), harmonic_target);
+	struct ggml_tensor * uv = ggml_mul(ctx, voiced, sin_amp_t);
+	struct ggml_tensor * noise_scale = ggml_add(ctx, ggml_mul(ctx, voiced, noise_delta), sin_amp_div_t);
+	struct ggml_tensor * noise = ggml_mul(ctx, noise_scale, rand_init);
 
 	return ggml_cont(ctx, ggml_transpose(ctx, ggml_add(ctx, ggml_mul(ctx, ggml_sin(ctx, cur), uv), noise)));
 }
 
 static struct ggml_tensor * build_generator(ggml_context * ctx, kokoro_model * model, kokoro_context * kctx, struct ggml_tensor * x, struct ggml_tensor * style, struct ggml_tensor * f0_curve, kokoro_generator* generator, int sequence_length, struct ggml_tensor * window_sq_sum, ggml_cgraph * gf) {
-	struct ggml_tensor * sing = build_sin_gen(ctx, model, kctx, f0_curve, model->harmonic_num + 1, f0_curve->ne[0] * 300, model->voice_threshold, model->sin_amp, model->noise_std);
+    kokoro_debug_generator_layout_scope layout_scope;
+    kokoro_debug_print_layout("generator.input_x", x);
+    kokoro_debug_print_layout("generator.style", style);
+    kokoro_debug_print_layout("generator.f0_curve", f0_curve);
+	struct ggml_tensor * sing = build_sin_gen(ctx, model, kctx, f0_curve, model->harmonic_num + 1, f0_curve->ne[0] * 300);
+	ggml_set_name(sing, "kokoro_sing");
+    kokoro_debug_print_layout("generator.sing", sing);
 	struct ggml_tensor * har = ggml_tanh(ctx, ggml_add(ctx, ggml_mul_mat(ctx, generator->m_source_weight, sing), generator->m_source_bias));
+	ggml_set_name(har, "kokoro_har_time");
+    kokoro_debug_print_layout("generator.har_time", har);
 
 	har = stft(ctx, ggml_cont(ctx, ggml_transpose(ctx, har)), generator->window, model->true_n_fft, model->stft_hop, true, true);
+	ggml_set_name(har, "kokoro_har_stft");
+    kokoro_debug_print_layout("generator.har_stft", har);
 
 	// stft returns a vector of shape [nfft, frames, batch, 2] where the final shape (2) separates the magnitude and the phase
 	// kokoro concatenates the n_fft from the magnitude and the phase together so we have to split them up and concatenate
@@ -204,19 +760,31 @@ static struct ggml_tensor * build_generator(ggml_context * ctx, kokoro_model * m
 	struct ggml_tensor * mhar  = ggml_cont(ctx, ggml_view_3d(ctx, har, har->ne[0], har->ne[1], har->ne[2], har->nb[1], har->nb[2], 0));
 	struct ggml_tensor * phhar = ggml_cont(ctx, ggml_view_3d(ctx, har, har->ne[0], har->ne[1], har->ne[2], har->nb[1], har->nb[2], har->nb[3]));
 	struct ggml_tensor * combined_har = ggml_cont(ctx, ggml_transpose(ctx, ggml_concat(ctx, mhar, phhar, 0)));
+	ggml_set_name(combined_har, "kokoro_combined_har");
+    kokoro_debug_print_layout("generator.combined_har", combined_har);
 
 	struct ggml_tensor * cur = x;
 	for (int i = 0; i < generator->ups.size(); i++) {
+        const std::string prefix = "generator.up." + std::to_string(i);
+        kokoro_debug_print_layout(prefix + ".entry", cur);
 		cur = ggml_leaky_relu(ctx, cur, 0.1f, false);
+        kokoro_debug_print_layout(prefix + ".leaky_relu", cur);
 		cur = ggml_add(ctx, ggml_conv_transpose_1d(ctx, generator->ups[i]->upsample_weight, ggml_cont(ctx, ggml_transpose(ctx, cur)), generator->ups[i]->stride, generator->ups[i]->padding, 1, 0, 1), generator->ups[i]->upsample_bias);
+		ggml_format_name(cur, "kokoro_up_%d", i);
+        kokoro_debug_print_layout(prefix + ".conv_transpose_add_bias", cur);
 		if (i == generator->ups.size() - 1) {
 			// This is a hacky way of implementing the simple reflection padding used here.
 			// In general, ggml should eventually be built to support expressive reflective padding but for such simple front padding this makes more sense.
 			struct ggml_tensor * temp = ggml_cont(ctx, ggml_view_3d(ctx, cur, 1, cur->ne[1], cur->ne[2], cur->nb[1], cur->nb[2], cur->nb[0]));
 			cur = ggml_concat(ctx, temp, cur, 0);
+			ggml_set_name(cur, "kokoro_up_padded");
+            kokoro_debug_print_layout(prefix + ".reflection_pad", cur);
 		}
 		struct ggml_tensor * x_source = build_noise_block(ctx, generator->noise_blocks[i], ggml_cont(ctx, combined_har), style);
+		ggml_format_name(x_source, "kokoro_noise_%d", i);
+        kokoro_debug_print_layout(prefix + ".noise_source", x_source);
 		cur = ggml_add(ctx, cur, x_source);
+        kokoro_debug_print_layout(prefix + ".add_noise", cur);
 		struct ggml_tensor * x = cur;
 		for (int ii = 0; ii < model->n_kernels; ii++) {
 			if (ii == 0) {
@@ -224,22 +792,33 @@ static struct ggml_tensor * build_generator(ggml_context * ctx, kokoro_model * m
 			} else {
 				cur = ggml_add(ctx, cur, build_kokoro_generator_res_block(ctx, x, style, generator->res_blocks[i*model->n_kernels+ii]));
 			}
+            kokoro_debug_print_layout(prefix + ".res_kernel." + std::to_string(ii), cur);
 		}
 		cur = ggml_cont(ctx, ggml_transpose(ctx, ggml_div(ctx, cur, model->n_kernels_tensor)));
+		ggml_format_name(cur, "kokoro_res_%d", i);
+        kokoro_debug_print_layout(prefix + ".res_average_transpose_cont", cur);
 		ggml_build_forward_expand(gf, cur);
 	}
 
 	cur = ggml_leaky_relu(ctx, cur, 0.01f, false);
-	cur = ggml_add(ctx, ggml_conv_1d(ctx, generator->out_conv_weight, ggml_cont(ctx, ggml_transpose(ctx, cur)), 1, model->out_conv_padding, 1), generator->out_conv_bias);
+    kokoro_debug_print_layout("generator.out.leaky_relu", cur);
+	cur = ggml_add(ctx, kokoro_conv_1d(ctx, generator->out_conv_weight, ggml_cont(ctx, ggml_transpose(ctx, cur)), 1, model->out_conv_padding, 1), generator->out_conv_bias);
+	ggml_set_name(cur, "kokoro_out_conv");
+    kokoro_debug_print_layout("generator.out.conv", cur);
 
 	struct ggml_tensor * spec = ggml_view_3d(ctx, cur, cur->ne[0], model->post_n_fft, cur->ne[2], cur->nb[1], cur->nb[2], 0);
 	struct ggml_tensor * phase = ggml_view_3d(ctx, cur, cur->ne[0], cur->ne[1] - model->post_n_fft, cur->ne[2], cur->nb[1], cur->nb[2], cur->nb[1] * model->post_n_fft);
 	phase = ggml_sin(ctx, phase);
+	ggml_set_name(phase, "kokoro_phase_sin");
+    kokoro_debug_print_layout("generator.out.phase_sin", phase);
 	spec = ggml_exp(ctx, spec);
+	ggml_set_name(spec, "kokoro_spec_exp");
+    kokoro_debug_print_layout("generator.out.spec_exp", spec);
 
 	cur = ggml_concat(ctx, spec, phase, 3); // istft expects the magnitude and phase concatenated after the batch;
 	cur = istft(ctx, ggml_cont(ctx, ggml_transpose(ctx, cur)), window_sq_sum, generator->window, model->true_n_fft, model->stft_hop, true, true);
 	ggml_set_name(cur, "after_res_gen");
+    kokoro_debug_print_layout("generator.out.istft", cur);
 	return cur;
 }
 
@@ -352,17 +931,16 @@ void kokoro_model::post_load_assign() {
 	}
 
 	if (window == "hann") {
-		std::vector<float> wdata;
-		wdata.reserve(true_n_fft);
-		hann_window(true_n_fft, wdata);
+		generator_window_data.clear();
+		generator_window_data.reserve(true_n_fft);
+		hann_window(true_n_fft, generator_window_data);
 		decoder->generator->window = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, true_n_fft);
 		decoder->generator->window->buffer = buf;
 		decoder->generator->window->data = (void *)((uint8_t *) ggml_backend_buffer_get_base(buf) + offset);
 		size_t size = ggml_nbytes(decoder->generator->window);
-		ggml_backend_tensor_set(decoder->generator->window, wdata.data(), 0, size);
+		ggml_backend_tensor_set(decoder->generator->window, generator_window_data.data(), 0, size);
     	ggml_set_name(decoder->generator->window, "stft_window");
     	offset += size;
-    	wdata.clear();
 	} else {
 		TTS_ABORT("Window of type %s is not supported.", window.c_str());
 	}
@@ -949,14 +1527,17 @@ struct ggml_cgraph * kokoro_duration_runner::build_kokoro_duration_graph(kokoro_
 
     kctx->inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.n_tokens);
     ggml_set_input(kctx->inp_tokens);
+    kctx->set_tensor_backend(kctx->inp_tokens);
 
     if (!model->static_token_types) {
     	kctx->token_types = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.n_tokens);
     	ggml_set_input(kctx->token_types);
+        kctx->set_tensor_backend(kctx->token_types);
     }
 
     kctx->positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.n_tokens);
     ggml_set_input(kctx->positions);
+    kctx->set_tensor_backend(kctx->positions);
 
     inpL = build_albert_inputs(ctx, model, kctx->inp_tokens, kctx->positions, kctx->token_types);
     ggml_set_name(inpL, "albert_embeddings");
@@ -1006,15 +1587,19 @@ struct ggml_cgraph * kokoro_duration_runner::build_kokoro_duration_graph(kokoro_
 	    }
         ggml_build_forward_expand(gf, cur);
     }
+    ggml_set_name(cur, "kokoro_albert_out");
 
     // duration / prosody prediction
     cur = ggml_add(ctx, ggml_mul_mat(ctx, model->prosody_pred->albert_encode, cur), model->prosody_pred->albert_encode_bias);
+    ggml_set_name(cur, "kokoro_prosody_encoded");
 
 	struct ggml_tensor * style_half = ggml_cont(ctx, ggml_view_1d(ctx, voice, voice->ne[0]/2, voice->ne[0] / 2 * voice->nb[0] + (batch.n_tokens - 3) * voice->nb[1]));
 
 	cur = ggml_concat(ctx, cur, ggml_repeat(ctx, style_half, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, style_half->ne[0], cur->ne[1])), 0);
+    ggml_set_name(cur, "kokoro_prosody_input");
 
-    for (auto l : model->prosody_pred->layers) {
+    for (int layer_idx = 0; layer_idx < (int)model->prosody_pred->layers.size(); layer_idx++) {
+        auto l = model->prosody_pred->layers[layer_idx];
     	cur = build_lstm(ctx, cur, l->rnn, batch.n_tokens, gf);
 
     	struct ggml_tensor * gamma = ggml_add(ctx, ggml_mul_mat(ctx, l->ada_norm_gamma_weight, style_half), l->ada_norm_gamma_bias);
@@ -1026,6 +1611,7 @@ struct ggml_cgraph * kokoro_duration_runner::build_kokoro_duration_graph(kokoro_
 		// An optimal remedy to this would be to increment the gamma bias above by one when preparing the gguf file for the model.
     	cur = ggml_add(ctx, ggml_add(ctx, cur, ggml_mul(ctx, cur, gamma)), beta);
     	cur = ggml_concat(ctx, cur, ggml_repeat(ctx, style_half, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, style_half->ne[0], cur->ne[1])), 0);
+        ggml_format_name(cur, "kokoro_prosody_layer_%d", layer_idx);
     }
 
     struct ggml_tensor * d = ggml_cont(ctx, cur);
@@ -1038,6 +1624,7 @@ struct ggml_cgraph * kokoro_duration_runner::build_kokoro_duration_graph(kokoro_
     // If we were to support speed we would add a constant tensor for the speed and divide here.
     len = ggml_round(ctx, ggml_sum_rows(ctx, cur));
     len = ggml_clamp(ctx, ggml_round(ctx, ggml_sum_rows(ctx, cur)), 1.0f, 50.0f);
+    ggml_set_name(len, "kokoro_duration_len");
 
     ggml_build_forward_expand(gf, len);
 
@@ -1054,19 +1641,22 @@ void kokoro_duration_runner::prepare_post_load() {
 
 void kokoro_duration_runner::set_inputs(kokoro_ubatch & batch) {
 	ggml_backend_tensor_set(kctx->inp_tokens, batch.input_tokens, 0, batch.n_tokens*ggml_element_size(kctx->inp_tokens));
-	uint32_t * positions_d = nullptr;
-    positions_d = (uint32_t *) kctx->positions->data;
-    float * attn_d = nullptr;
-    attn_d = (float *) kctx->attn_mask->data;
+	std::vector<uint32_t> positions(batch.n_tokens);
+	std::vector<float> attn_mask(batch.n_tokens * batch.n_tokens, 0.0f);
 	for (uint32_t i = 0; i < batch.n_tokens; i++) {
-        positions_d[i] =  i;
-        for (uint32_t ii = 0; ii < batch.n_tokens; ii++) {
-        	attn_d[i*batch.n_tokens + ii] = 0.0f; // Kokoro doesn't use causal attention as it isnt an autoregressive generative model;
-        }
+        positions[i] =  i;
     }
+	ggml_backend_tensor_set(kctx->positions, positions.data(), 0, positions.size()*sizeof(uint32_t));
+	ggml_backend_tensor_set(kctx->attn_mask, attn_mask.data(), 0, attn_mask.size()*sizeof(float));
+	if (!model->static_token_types && kctx->token_types) {
+		std::vector<uint32_t> token_types(batch.n_tokens, 0);
+		ggml_backend_tensor_set(kctx->token_types, token_types.data(), 0, token_types.size()*sizeof(uint32_t));
+	}
 }
 
 void kokoro_duration_runner::run(kokoro_ubatch & batch) {
+    const bool debug_timings = kokoro_debug_timings_enabled();
+    const auto t_start = std::chrono::steady_clock::now();
     ggml_backend_sched_reset(kctx->sched);
 
     size_t prev_size = kctx->buf_output ? ggml_backend_buffer_get_size(kctx->buf_output) : 0;
@@ -1085,7 +1675,7 @@ void kokoro_duration_runner::run(kokoro_ubatch & batch) {
     new_size = model->max_context_length * sizeof(float);
 
     if (!kctx->buf_len_output || prev_size < new_size) {
-        if (kctx->buf_output) {
+        if (kctx->buf_len_output) {
             ggml_backend_buffer_free(kctx->buf_len_output);
             kctx->buf_len_output = nullptr;
             kctx->lens = nullptr;
@@ -1102,24 +1692,85 @@ void kokoro_duration_runner::run(kokoro_ubatch & batch) {
 
     struct ggml_cgraph * gf = NULL;
     gf = build_kokoro_duration_graph(batch);
+    kokoro_debug_print_graph_ops("duration", gf);
+    const auto t_built = std::chrono::steady_clock::now();
 
     // the output is always the last tensor in the graph
     struct ggml_tensor * lens = gf->nodes[gf->n_nodes - 1];
-    // the reused duration hidden states are computed before a node chunk which has a size that is sequence length dependent
-    struct ggml_tensor * hidden_states = gf->nodes[gf->n_nodes - 22 - 52 * batch.n_tokens];
-    ggml_backend_sched_alloc_graph(kctx->sched, gf);
+    struct ggml_tensor * hidden_states = kokoro_find_graph_node(gf, "duration_hidden_states");
+    if (!hidden_states) {
+        TTS_ABORT("Failed to find duration hidden states in Kokoro graph.\n");
+    }
+    struct duration_debug_dump {
+        kokoro_duration_context * kctx;
+        std::vector<ggml_tensor *> nodes;
+        int start;
+    };
+
+    duration_debug_dump debug_dump = { kctx, {}, 0 };
+    const char * dump_nodes_env = std::getenv("KOKORO_DEBUG_DURATION_NODES");
+    if (dump_nodes_env) {
+        const int dump_nodes = std::max(0, std::atoi(dump_nodes_env));
+        debug_dump.nodes.assign(gf->nodes, gf->nodes + gf->n_nodes);
+        debug_dump.start = std::max(0, gf->n_nodes - dump_nodes);
+        ggml_backend_sched_set_eval_callback(kctx->sched, +[](ggml_tensor * node, bool ask, void * user_data) -> bool {
+            auto * dump = static_cast<duration_debug_dump *>(user_data);
+            auto it = std::find(dump->nodes.begin(), dump->nodes.end(), node);
+            if (it == dump->nodes.end()) {
+                return false;
+            }
+            const int idx = (int)std::distance(dump->nodes.begin(), it);
+            const bool is_view_op = node->op == GGML_OP_VIEW ||
+                node->op == GGML_OP_RESHAPE ||
+                node->op == GGML_OP_PERMUTE ||
+                node->op == GGML_OP_TRANSPOSE;
+            const bool should_dump = idx >= dump->start &&
+                node->type == GGML_TYPE_F32 &&
+                !is_view_op;
+            if (ask || !should_dump) {
+                return should_dump;
+            }
+
+            kokoro_debug_print_tensor_stats(dump->kctx, "KOKORO_DURATION_NODE", idx, node);
+            return true;
+        }, &debug_dump);
+    }
+
+    kctx->alloc_graph(gf, "kokoro.duration");
+    const auto t_alloc = std::chrono::steady_clock::now();
 
     set_inputs(batch);
+    const auto t_inputs = std::chrono::steady_clock::now();
 
     ggml_backend_sched_graph_compute_async(kctx->sched, gf);
+    const auto t_compute = std::chrono::steady_clock::now();
+    if (dump_nodes_env) {
+        ggml_backend_sched_set_eval_callback(kctx->sched, nullptr, nullptr);
+    }
 
     kctx->get_ggml_node_data(lens, batch.resp->lengths, batch.n_tokens*sizeof(float), kctx->buf_len_output);
     kctx->get_ggml_node_data(hidden_states, batch.resp->hidden_states, batch.n_tokens*(model->duration_hidden_size+model->style_half_size)*sizeof(float));
+    const auto t_read = std::chrono::steady_clock::now();
 
     // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
     // overlap with device computation.
     ggml_backend_sched_reset(kctx->sched);
+    const auto t_done = std::chrono::steady_clock::now();
     batch.resp->n_outputs = batch.n_tokens;
+    if (debug_timings) {
+        std::cerr << "KOKORO_TIMING phase=duration"
+                  << " backend=" << (kctx->backend ? ggml_backend_name(kctx->backend) : "CPU")
+                  << " tokens=" << batch.n_tokens
+                  << " nodes=" << gf->n_nodes
+                  << " build_ms=" << kokoro_elapsed_ms(t_start, t_built)
+                  << " alloc_ms=" << kokoro_elapsed_ms(t_built, t_alloc)
+                  << " input_ms=" << kokoro_elapsed_ms(t_alloc, t_inputs)
+                  << " compute_submit_ms=" << kokoro_elapsed_ms(t_inputs, t_compute)
+                  << " read_ms=" << kokoro_elapsed_ms(t_compute, t_read)
+                  << " reset_ms=" << kokoro_elapsed_ms(t_read, t_done)
+                  << " total_ms=" << kokoro_elapsed_ms(t_start, t_done)
+                  << std::endl;
+    }
 }
 
 kokoro_ubatch kokoro_runner::build_worst_case_batch() {
@@ -1152,38 +1803,53 @@ struct ggml_cgraph * kokoro_runner::build_kokoro_graph(kokoro_ubatch & batch) {
 
     kctx->inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.n_tokens);
     ggml_set_input(kctx->inp_tokens);
+    kctx->set_tensor_backend(kctx->inp_tokens);
 
     kctx->duration_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kctx->total_duration, kctx->sequence_length);
     ggml_set_input(kctx->duration_mask);
+    kctx->set_tensor_backend(kctx->duration_mask);
 
     kctx->duration_pred = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, model->duration_hidden_size + model->style_half_size, kctx->sequence_length);
     ggml_set_input(kctx->duration_pred);
+    kctx->set_tensor_backend(kctx->duration_pred);
 
     // seeing as we are setting the inputs for these, we shouldn't need to perform tranpositions here
     cur = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, kctx->duration_mask)), ggml_cont(ctx, ggml_transpose(ctx, kctx->duration_pred)));
     cur = ggml_cont(ctx, ggml_transpose(ctx, cur));
+    ggml_set_name(cur, "kokoro_duration_expanded");
 
     cur = build_lstm(ctx, cur, model->prosody_pred->shared_lstm, cur->ne[1], gf);
+    ggml_set_name(cur, "kokoro_shared_lstm");
 
 
     struct ggml_tensor * f0_curve = cur;
     f0_curve = ggml_cont(ctx, ggml_transpose(ctx, f0_curve));
-    for (auto block : model->prosody_pred->f0_blocks) {
+    ggml_set_name(f0_curve, "kokoro_f0_input");
+    for (int block_idx = 0; block_idx < (int)model->prosody_pred->f0_blocks.size(); block_idx++) {
+        auto block = model->prosody_pred->f0_blocks[block_idx];
     	f0_curve = build_ada_residual_conv(ctx, f0_curve, block, style_half, model->sqrt_tensor);
+        ggml_format_name(f0_curve, "kokoro_f0_block_%d", block_idx);
     }
     f0_curve = ggml_cont(ctx, ggml_transpose(ctx, f0_curve));
+    ggml_set_name(f0_curve, "kokoro_f0_pre_proj");
     f0_curve = ggml_mul_mat(ctx, model->prosody_pred->f0_proj_kernel, f0_curve);
+    ggml_set_name(f0_curve, "kokoro_f0_proj");
     f0_curve = squeeze_3d_2d_e0(ctx, f0_curve);
     f0_curve = ggml_add(ctx, f0_curve, model->prosody_pred->f0_proj_bias);
     ggml_set_name(f0_curve, "f0_out");
 
     struct ggml_tensor * n = cur;
     n = ggml_cont(ctx, ggml_transpose(ctx, n));
-    for (auto block : model->prosody_pred->n_blocks) {
+    ggml_set_name(n, "kokoro_n_input");
+    for (int block_idx = 0; block_idx < (int)model->prosody_pred->n_blocks.size(); block_idx++) {
+		auto block = model->prosody_pred->n_blocks[block_idx];
 		n = build_ada_residual_conv(ctx, n, block, style_half, model->sqrt_tensor);
+        ggml_format_name(n, "kokoro_n_block_%d", block_idx);
     }
     n = ggml_cont(ctx, ggml_transpose(ctx, n));
+    ggml_set_name(n, "kokoro_n_pre_proj");
 	n = ggml_mul_mat(ctx, model->prosody_pred->n_proj_kernel, n);
+    ggml_set_name(n, "kokoro_n_proj");
 	n = squeeze_3d_2d_e0(ctx, n);
 	n = ggml_add(ctx, n, model->prosody_pred->n_proj_bias);
 	ggml_set_name(n, "n_out");
@@ -1196,7 +1862,7 @@ struct ggml_cgraph * kokoro_runner::build_kokoro_graph(kokoro_ubatch & batch) {
 		cur = ggml_get_rows(ctx, model->text_encoder->embd, kctx->inp_tokens);
 
 		for (auto l : model->text_encoder->conv_layers) {
-			cur = ggml_cont(ctx, ggml_transpose(ctx, ggml_add(ctx, ggml_conv_1d(ctx, l->conv_weight, ggml_cont(ctx, ggml_transpose(ctx, cur)), 1, 2, 1), l->conv_bias)));
+			cur = ggml_cont(ctx, ggml_transpose(ctx, ggml_add(ctx, kokoro_conv_1d(ctx, l->conv_weight, ggml_cont(ctx, ggml_transpose(ctx, cur)), 1, 2, 1), l->conv_bias)));
 			cur = ggml_norm(ctx, cur, 0.00001);
 			cur = ggml_add(ctx, ggml_mul(ctx, cur, l->norm_gamma), l->norm_beta);
 			cur = ggml_leaky_relu(ctx, cur, 0.2f, false);
@@ -1213,8 +1879,8 @@ struct ggml_cgraph * kokoro_runner::build_kokoro_graph(kokoro_ubatch & batch) {
 	struct ggml_tensor * style_half2 = ggml_view_1d(ctx, voice, voice->ne[0]/2, (batch.n_tokens - 3) * voice->nb[1]);
 
 	{
-		f0 = ggml_add(ctx, ggml_conv_1d(ctx, model->decoder->f0_conv, f0_curve, 2, 1, 1), model->decoder->f0_conv_bias);
-		n_base = ggml_add(ctx, ggml_conv_1d(ctx, model->decoder->n_conv, n, 2, 1, 1), model->decoder->n_conv_bias);
+		f0 = ggml_add(ctx, kokoro_conv_1d(ctx, model->decoder->f0_conv, f0_curve, 2, 1, 1), model->decoder->f0_conv_bias);
+		n_base = ggml_add(ctx, kokoro_conv_1d(ctx, model->decoder->n_conv, n, 2, 1, 1), model->decoder->n_conv_bias);
 		cur = ggml_concat(ctx, ggml_concat(ctx, ggml_cont(ctx, ggml_transpose(ctx, asr)), f0, 1), n_base, 1);
 		cur = build_ada_residual_conv(ctx, cur, model->decoder->encoder_block, style_half2, model->sqrt_tensor);
 		ggml_build_forward_expand(gf, cur);
@@ -1233,6 +1899,7 @@ struct ggml_cgraph * kokoro_runner::build_kokoro_graph(kokoro_ubatch & batch) {
 
 	kctx->window_sq_sum = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, kctx->total_duration*model->up_sampling_factor);
 	ggml_set_input(kctx->window_sq_sum);
+	kctx->set_tensor_backend(kctx->window_sq_sum);
 
 	// run generation
 	cur = build_generator(ctx, &*model, kctx, cur, style_half2, f0_curve, model->decoder->generator, (int)kctx->sequence_length, kctx->window_sq_sum, gf);
@@ -1245,6 +1912,9 @@ void kokoro_runner::prepare_post_load() {
     propagate_voice_setting();
 	model->post_load_assign();
 	drunner->prepare_post_load();
+    if (backend_is_vulkan(kctx->backend)) {
+        return;
+    }
     auto batch = build_worst_case_batch();
     auto gf = build_kokoro_graph(batch);
     kctx->prep_schedule(gf);
@@ -1252,31 +1922,50 @@ void kokoro_runner::prepare_post_load() {
 }
 
 void kokoro_runner::set_inputs(kokoro_ubatch & batch, uint32_t total_size) {
-	random_uniform_gen(total_size * model->up_sampling_factor * (model->harmonic_num + 1), ((float*)kctx->uv_noise_data->data) + 4);
-    ((float*) kctx->uv_noise_data->data)[0] = model->voice_threshold;
-    ((float*) kctx->uv_noise_data->data)[1] = model->noise_std;
-    ((float*) kctx->uv_noise_data->data)[2] = model->sin_amp;
-    ((float*) kctx->uv_noise_data->data)[3] = model->sin_amp / 3.0f;
-	compute_window_squared_sum(model->true_n_fft, model->stft_hop, total_size*model->up_sampling_factor/model->stft_hop, (float*) kctx->window_sq_sum->data, (float*) model->decoder->generator->window->data);
+	const size_t uv_noise_count = (size_t) total_size * model->up_sampling_factor * (model->harmonic_num + 1);
+	std::vector<float> uv_noise(uv_noise_count + 4);
+	if (!kokoro_debug_fill_seeded_uv_noise(uv_noise, 4)) {
+		random_uniform_gen((int)uv_noise_count, uv_noise.data() + 4);
+	}
+    uv_noise[0] = -model->voice_threshold;
+    uv_noise[1] = model->noise_std - model->sin_amp / 3.0f;
+    uv_noise[2] = model->sin_amp;
+    uv_noise[3] = model->sin_amp / 3.0f;
+	ggml_backend_tensor_set(kctx->uv_noise_data, uv_noise.data(), 0, uv_noise.size()*sizeof(float));
+
+	std::vector<float> local_window;
+	const float * window_data = model->generator_window_data.data();
+	if (model->generator_window_data.size() != model->true_n_fft) {
+		local_window.reserve(model->true_n_fft);
+		hann_window(model->true_n_fft, local_window);
+		window_data = local_window.data();
+	}
+	const size_t window_sq_sum_count = (size_t) total_size * model->up_sampling_factor;
+	std::vector<float> window_sq_sum(window_sq_sum_count);
+	compute_window_squared_sum(model->true_n_fft, model->stft_hop, window_sq_sum_count/model->stft_hop, window_sq_sum.data(), (float *)window_data);
+	ggml_backend_tensor_set(kctx->window_sq_sum, window_sq_sum.data(), 0, window_sq_sum.size()*sizeof(float));
 	kctx->sequence_length = batch.n_tokens;
 	kctx->total_duration = total_size;
 	ggml_backend_tensor_set(kctx->inp_tokens, batch.input_tokens, 0, batch.n_tokens*ggml_element_size(kctx->inp_tokens));
 	ggml_backend_tensor_set(kctx->duration_pred, batch.resp->hidden_states, 0, batch.n_tokens*(model->duration_hidden_size + model->style_half_size)*ggml_element_size(kctx->duration_pred));
-	float * d = nullptr;
 	float running = 0;
-    d = (float *) kctx->duration_mask->data;
+	std::vector<float> duration_mask((size_t)batch.n_tokens * total_size);
 	for (uint32_t i = 0; i < batch.n_tokens; i++) {
 		float next_running = running + batch.resp->lengths[i];
 		for (uint32_t ii = 0; ii < total_size; ii++) {
-			d[i*total_size+ii] = ii >= running && ii < next_running ? 1.0f : 0.0f;
+			duration_mask[(size_t)i*total_size+ii] = ii >= running && ii < next_running ? 1.0f : 0.0f;
 		}
 		running = next_running;
     }
+	ggml_backend_tensor_set(kctx->duration_mask, duration_mask.data(), 0, duration_mask.size()*sizeof(float));
 }
 
 void kokoro_runner::run(kokoro_ubatch & batch, tts_response & outputs) {
+    const bool debug_timings = kokoro_debug_timings_enabled();
+    const auto t_start = std::chrono::steady_clock::now();
 	batch.resp = new kokoro_duration_response;
 	drunner->run(batch);
+    const auto t_duration = std::chrono::steady_clock::now();
 
 	ggml_backend_sched_reset(kctx->sched);
 
@@ -1303,24 +1992,75 @@ void kokoro_runner::run(kokoro_ubatch & batch, tts_response & outputs) {
 	kctx->total_duration = total_length;
 
     struct ggml_cgraph * gf = NULL;
-    gf = build_kokoro_graph(batch);
+	gf = build_kokoro_graph(batch);
+	kokoro_debug_print_graph_ops("generate", gf);
+    const auto t_built = std::chrono::steady_clock::now();
 
     // the output is always the last tensor in the graph
     struct ggml_tensor * output = gf->nodes[gf->n_nodes - 1];
+	struct generate_debug_dump {
+		kokoro_context * kctx;
+		std::vector<ggml_tensor *> nodes;
+		std::vector<std::string> names;
+	};
 
-    ggml_backend_sched_alloc_graph(kctx->sched, gf);
+	generate_debug_dump debug_dump = { kctx, {}, {} };
+	const char * dump_names_env = std::getenv("KOKORO_DEBUG_GENERATE_NODE_NAMES");
+	if (dump_names_env) {
+		debug_dump.nodes.assign(gf->nodes, gf->nodes + gf->n_nodes);
+		debug_dump.names = kokoro_debug_split_csv(dump_names_env);
+		ggml_backend_sched_set_eval_callback(kctx->sched, +[](ggml_tensor * node, bool ask, void * user_data) -> bool {
+			auto * dump = static_cast<generate_debug_dump *>(user_data);
+			const bool should_dump = node &&
+				node->type == GGML_TYPE_F32 &&
+				kokoro_debug_name_enabled(dump->names, ggml_get_name(node));
+			if (ask || !should_dump) {
+				return should_dump;
+			}
+			auto it = std::find(dump->nodes.begin(), dump->nodes.end(), node);
+			const int idx = it == dump->nodes.end() ? -1 : (int)std::distance(dump->nodes.begin(), it);
+			kokoro_debug_print_tensor_stats(dump->kctx, "KOKORO_GENERATE_NODE", idx, node);
+			return true;
+		}, &debug_dump);
+	}
+    kctx->alloc_graph(gf, "kokoro.generate");
+    const auto t_alloc = std::chrono::steady_clock::now();
 
     set_inputs(batch, total_length);
+    const auto t_inputs = std::chrono::steady_clock::now();
 
-    ggml_backend_sched_graph_compute_async(kctx->sched, gf);
+	ggml_backend_sched_graph_compute_async(kctx->sched, gf);
+    const auto t_compute = std::chrono::steady_clock::now();
+	if (dump_names_env) {
+		ggml_backend_sched_set_eval_callback(kctx->sched, nullptr, nullptr);
+	}
 
     kctx->get_ggml_node_data(output, outputs.data, new_size);
+    const auto t_read = std::chrono::steady_clock::now();
 
     // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
     // overlap with device computation.
     ggml_backend_sched_reset(kctx->sched);
+    const auto t_done = std::chrono::steady_clock::now();
     outputs.n_outputs = total_length*model->up_sampling_factor;
     free(batch.resp);
+    if (debug_timings) {
+        std::cerr << "KOKORO_TIMING phase=generate"
+                  << " backend=" << (kctx->backend ? ggml_backend_name(kctx->backend) : "CPU")
+                  << " tokens=" << batch.n_tokens
+                  << " duration_frames=" << total_length
+                  << " output_samples=" << outputs.n_outputs
+                  << " nodes=" << gf->n_nodes
+                  << " duration_ms=" << kokoro_elapsed_ms(t_start, t_duration)
+                  << " build_ms=" << kokoro_elapsed_ms(t_duration, t_built)
+                  << " alloc_ms=" << kokoro_elapsed_ms(t_built, t_alloc)
+                  << " input_ms=" << kokoro_elapsed_ms(t_alloc, t_inputs)
+                  << " compute_submit_ms=" << kokoro_elapsed_ms(t_inputs, t_compute)
+                  << " read_ms=" << kokoro_elapsed_ms(t_compute, t_read)
+                  << " reset_ms=" << kokoro_elapsed_ms(t_read, t_done)
+                  << " total_ms=" << kokoro_elapsed_ms(t_start, t_done)
+                  << std::endl;
+    }
     return;
 }
 
@@ -1410,12 +2150,17 @@ void kokoro_runner::generate(const char * prompt, tts_response & response, const
     voice = config.voice;
     espeak_voice_id = config.espeak_voice_id;
     propagate_voice_setting();
-    // replace all non-sentence terminating characters with '--' which espeak will treat as a pause.
-    // We preserve the other punctuation for cleaner chunking pre-tokenization
-    std::string normalized{prompt};
-    normalized = replace_any(prompt, ",;:", "--");
-    normalized = replace_any(prompt, "\n", " ");
-    std::string phonemized_prompt = phmzr->text_to_phonemes(normalized);
+    std::string phonemized_prompt;
+    if (config.input_phonemes) {
+        phonemized_prompt = strip(replace_any(prompt, "\n", " "));
+    } else {
+        // replace all non-sentence terminating characters with '--' which espeak will treat as a pause.
+        // We preserve the other punctuation for cleaner chunking pre-tokenization
+        std::string normalized{prompt};
+        normalized = replace_any(prompt, ",;:", "--");
+        normalized = replace_any(prompt, "\n", " ");
+        phonemized_prompt = phmzr->text_to_phonemes(normalized);
+    }
 
   	// Kokoro users a utf-8 single character tokenizer so if the size of the prompt is smaller than the max context length without the
   	// beginning of sentence and end of sentence tokens then we can compute it all at once.
@@ -1460,11 +2205,7 @@ const char * get_espeak_id_from_kokoro_voice(std::string voice) {
 
 struct kokoro_duration_context * build_new_duration_kokoro_context(struct kokoro_model * model, int n_threads, bool use_cpu) {
     kokoro_duration_context * kctx = new kokoro_duration_context(model, n_threads);
-    if (!use_cpu) {
-#ifdef GGML_USE_METAL
-        kctx->backend = ggml_backend_metal_init();
-#endif
-    }
+    kctx->backend = tts_backend_init_accelerator(use_cpu);
     kctx->backend_cpu = ggml_backend_cpu_init();
     kctx->set_threads();
     kctx->build_schedule();
@@ -1475,11 +2216,7 @@ struct kokoro_duration_context * build_new_duration_kokoro_context(struct kokoro
 
 struct kokoro_context * build_new_kokoro_context(struct kokoro_model * model, int n_threads, bool use_cpu) {
     kokoro_context * kctx = new kokoro_context(model, n_threads);
-    if (!use_cpu) {
-#ifdef GGML_USE_METAL
-        kctx->backend = ggml_backend_metal_init();
-#endif
-    }
+    kctx->backend = tts_backend_init_accelerator(use_cpu);
     kctx->backend_cpu = ggml_backend_cpu_init();
     kctx->set_threads();
     kctx->build_schedule();
