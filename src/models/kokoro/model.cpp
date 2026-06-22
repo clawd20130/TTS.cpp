@@ -41,6 +41,11 @@ static bool kokoro_fuse_lstm_scan_enabled() {
     return env && env[0] && std::strcmp(env, "0") != 0;
 }
 
+static bool kokoro_fuse_lstm_step_enabled() {
+    const char * env = std::getenv("KOKORO_FUSE_LSTM_STEP");
+    return env && env[0] && std::strcmp(env, "0") != 0;
+}
+
 static bool kokoro_fuse_conv1d_enabled() {
     const char * env = std::getenv("KOKORO_FUSE_CONV1D");
     return env && env[0] && std::strcmp(env, "0") != 0;
@@ -64,6 +69,14 @@ static bool kokoro_debug_lstm_stats_enabled() {
 static double kokoro_elapsed_ms(std::chrono::steady_clock::time_point start,
                                 std::chrono::steady_clock::time_point end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+static size_t kokoro_pad_to_alignment(size_t offset, size_t alignment) {
+    if (alignment == 0) {
+        return offset;
+    }
+    TTS_ASSERT((alignment & (alignment - 1)) == 0);
+    return (offset + alignment - 1) & ~(alignment - 1);
 }
 
 static int kokoro_debug_generator_layout_depth = 0;
@@ -163,6 +176,7 @@ static bool kokoro_debug_shape_op(const ggml_tensor * node) {
     }
     switch (node->op) {
         case GGML_OP_KOKORO_CONV_1D:
+        case GGML_OP_KOKORO_LSTM_STEP:
         case GGML_OP_KOKORO_SNAKE_1D_T:
         case GGML_OP_KOKORO_ADAIN_SNAKE_1D_T:
         case GGML_OP_CONV_TRANSPOSE_1D:
@@ -170,6 +184,9 @@ static bool kokoro_debug_shape_op(const ggml_tensor * node) {
         case GGML_OP_CONT:
         case GGML_OP_TRANSPOSE:
         case GGML_OP_NORM:
+        case GGML_OP_ADD:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
         case GGML_OP_LEAKY_RELU:
         case GGML_OP_CONCAT:
             return true;
@@ -475,7 +492,7 @@ static struct ggml_tensor * build_lstm(ggml_context * ctx, ggml_tensor * input, 
         if (debug_lstm_stats && c == 0) {
             lstm_node_count_before = gf ? gf->n_nodes : 0;
         }
-        const bool fuse_gates = kokoro_fuse_lstm_gates_enabled() || kokoro_fuse_lstm_scan_enabled();
+        const bool fuse_gates = kokoro_fuse_lstm_gates_enabled() || kokoro_fuse_lstm_scan_enabled() || kokoro_fuse_lstm_step_enabled();
 		resp = fuse_gates
             ? build_lstm_run_fused(ctx, gf, resp, rnn->hidden[c], rnn->states[c], rnn->cells[c]->weights, rnn->cells[c]->biases, sequence_length)
             : build_lstm_run(ctx, gf, resp, rnn->hidden[c], rnn->states[c], rnn->cells[c]->weights, rnn->cells[c]->biases, sequence_length);
@@ -506,6 +523,7 @@ static struct ggml_tensor * build_lstm(ggml_context * ctx, ggml_tensor * input, 
                   << " nodes_after=" << node_count_after
                   << " fused_gates=" << (kokoro_fuse_lstm_gates_enabled() ? 1 : 0)
                   << " fused_scan=" << (kokoro_fuse_lstm_scan_enabled() ? 1 : 0)
+                  << " fused_step=" << (kokoro_fuse_lstm_step_enabled() ? 1 : 0)
                   << " ops=" << kokoro_debug_op_counts(gf, lstm_node_count_before, node_count_after, 12)
                   << std::endl;
     }
@@ -590,15 +608,30 @@ static struct ggml_tensor * build_lstm_run_fused(ggml_context * ctx, ggml_cgraph
 
 	for (int index = 0; index < sequence_length; index++) {
 		int i = reversed ? sequence_length - 1 - index : index;
-        struct ggml_tensor * recurrent_gates = ggml_add(ctx, ggml_mul_mat(ctx, recurrent_weights, h_0), recurrent_biases);
+        if (kokoro_fuse_lstm_step_enabled()) {
+            struct ggml_tensor * input_gate_step = ggml_view_3d(ctx,
+                                                                input_gates,
+                                                                input_gates->ne[0],
+                                                                1,
+                                                                1,
+                                                                input_gates->nb[1],
+                                                                input_gates->nb[2],
+                                                                input_gates->nb[1] * i);
+            struct ggml_tensor * recurrent_linear = ggml_mul_mat(ctx, recurrent_weights, h_0);
+            struct ggml_tensor * step = ggml_kokoro_lstm_step(ctx, input_gate_step, recurrent_linear, recurrent_biases, c_0);
+            h_0 = ggml_view_3d(ctx, step, hidden_size, 1, 1, step->nb[1], step->nb[2], 0);
+            c_0 = ggml_view_3d(ctx, step, hidden_size, 1, 1, step->nb[1], step->nb[2], step->nb[1]);
+        } else {
+            struct ggml_tensor * recurrent_gates = ggml_add(ctx, ggml_mul_mat(ctx, recurrent_weights, h_0), recurrent_biases);
 
-		struct ggml_tensor * I_cur = ggml_sigmoid(ctx, ggml_add(ctx, lstm_gate_view(ctx, input_gates, 0, hidden_size, i), lstm_gate_view(ctx, recurrent_gates, 0, hidden_size)));
-		struct ggml_tensor * F_cur = ggml_sigmoid(ctx, ggml_add(ctx, lstm_gate_view(ctx, input_gates, 1, hidden_size, i), lstm_gate_view(ctx, recurrent_gates, 1, hidden_size)));
-		struct ggml_tensor * G_cur = ggml_tanh(ctx, ggml_add(ctx, lstm_gate_view(ctx, input_gates, 2, hidden_size, i), lstm_gate_view(ctx, recurrent_gates, 2, hidden_size)));
-		struct ggml_tensor * O_cur = ggml_sigmoid(ctx, ggml_add(ctx, lstm_gate_view(ctx, input_gates, 3, hidden_size, i), lstm_gate_view(ctx, recurrent_gates, 3, hidden_size)));
+            struct ggml_tensor * I_cur = ggml_sigmoid(ctx, ggml_add(ctx, lstm_gate_view(ctx, input_gates, 0, hidden_size, i), lstm_gate_view(ctx, recurrent_gates, 0, hidden_size)));
+            struct ggml_tensor * F_cur = ggml_sigmoid(ctx, ggml_add(ctx, lstm_gate_view(ctx, input_gates, 1, hidden_size, i), lstm_gate_view(ctx, recurrent_gates, 1, hidden_size)));
+            struct ggml_tensor * G_cur = ggml_tanh(ctx, ggml_add(ctx, lstm_gate_view(ctx, input_gates, 2, hidden_size, i), lstm_gate_view(ctx, recurrent_gates, 2, hidden_size)));
+            struct ggml_tensor * O_cur = ggml_sigmoid(ctx, ggml_add(ctx, lstm_gate_view(ctx, input_gates, 3, hidden_size, i), lstm_gate_view(ctx, recurrent_gates, 3, hidden_size)));
 
-		c_0 = ggml_add(ctx, ggml_mul(ctx, F_cur, c_0), ggml_mul(ctx, I_cur, G_cur));
-		h_0 = ggml_mul(ctx, ggml_tanh(ctx, c_0), O_cur);
+            c_0 = ggml_add(ctx, ggml_mul(ctx, F_cur, c_0), ggml_mul(ctx, I_cur, G_cur));
+            h_0 = ggml_mul(ctx, ggml_tanh(ctx, c_0), O_cur);
+        }
 
 		if (index == 0) {
 			outputs = h_0;
@@ -626,7 +659,7 @@ static struct ggml_tensor * build_ada_residual_conv(ggml_context * ctx, struct g
 	cur = ggml_leaky_relu(ctx, cur, 0.2f, false);
 
 	if (block->pool) {
-		cur = ggml_conv_transpose_1d(ctx, block->pool, cur, 2, 1, 1, 1, cur->ne[1]);
+		cur = ggml_conv_transpose_1d_ex(ctx, block->pool, cur, 2, 1, 1, 1, cur->ne[1]);
 		cur = ggml_add(ctx, cur, block->pool_bias);
 	}
 
@@ -649,7 +682,7 @@ static struct ggml_tensor * build_ada_residual_conv(ggml_context * ctx, struct g
 	if (block->upsample) {
 		cur = ggml_cont(ctx, ggml_transpose(ctx, cur));
 		if (block->pool) {
-			cur = ggml_upscale_ext(ctx, cur, cur->ne[0], cur->ne[1]*2, cur->ne[2], cur->ne[3]);
+			cur = ggml_upscale_ext(ctx, cur, cur->ne[0], cur->ne[1]*2, cur->ne[2], cur->ne[3], GGML_SCALE_MODE_NEAREST);
 		}
 		cur = ggml_mul_mat(ctx, block->upsample, cur);
 		cur = ggml_cont(ctx, ggml_transpose(ctx, cur));
@@ -715,9 +748,9 @@ static struct ggml_tensor * build_noise_block(ggml_context * ctx, kokoro_noise_r
 
 static struct ggml_tensor * build_sin_gen(ggml_context * ctx, kokoro_model * model, kokoro_context * kctx, struct ggml_tensor * x, int harmonic_num, int sequence_length) {
 	struct ggml_tensor * cur = ggml_mul(ctx, ggml_repeat(ctx, x, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], harmonic_num)), model->harmonic_sampling_norm);
-	cur = ggml_mul(ctx, ggml_cumsum(ctx, ggml_mod(ctx, cur, 1.0f)), model->sampling_factor_scalar);
-	cur = ggml_upscale_linear(ctx, cur, 300);
-	struct ggml_tensor * upscaled = ggml_upscale_ext(ctx, x, x->ne[0]*300, x->ne[1], x->ne[2], x->ne[3]);
+	cur = ggml_mul(ctx, ggml_cumsum(ctx, ggml_sub(ctx, cur, ggml_floor(ctx, cur))), model->sampling_factor_scalar);
+	cur = ggml_upscale_ext(ctx, cur, cur->ne[0] * 300, cur->ne[1], cur->ne[2], cur->ne[3], GGML_SCALE_MODE_BILINEAR);
+	struct ggml_tensor * upscaled = ggml_upscale_ext(ctx, x, x->ne[0]*300, x->ne[1], x->ne[2], x->ne[3], GGML_SCALE_MODE_NEAREST);
 
 	kctx->uv_noise_data = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, sequence_length*harmonic_num+4);
 	ggml_set_input(kctx->uv_noise_data);
@@ -769,7 +802,7 @@ static struct ggml_tensor * build_generator(ggml_context * ctx, kokoro_model * m
         kokoro_debug_print_layout(prefix + ".entry", cur);
 		cur = ggml_leaky_relu(ctx, cur, 0.1f, false);
         kokoro_debug_print_layout(prefix + ".leaky_relu", cur);
-		cur = ggml_add(ctx, ggml_conv_transpose_1d(ctx, generator->ups[i]->upsample_weight, ggml_cont(ctx, ggml_transpose(ctx, cur)), generator->ups[i]->stride, generator->ups[i]->padding, 1, 0, 1), generator->ups[i]->upsample_bias);
+		cur = ggml_add(ctx, ggml_conv_transpose_1d_ex(ctx, generator->ups[i]->upsample_weight, ggml_cont(ctx, ggml_transpose(ctx, cur)), generator->ups[i]->stride, generator->ups[i]->padding, 1, 0, 1), generator->ups[i]->upsample_bias);
 		ggml_format_name(cur, "kokoro_up_%d", i);
         kokoro_debug_print_layout(prefix + ".conv_transpose_add_bias", cur);
 		if (i == generator->ups.size() - 1) {
@@ -888,6 +921,12 @@ size_t kokoro_model::max_duration_nodes() {
 
 void kokoro_model::post_load_assign() {
 	size_t original_offset = offset;
+	const size_t alignment = ggml_backend_buffer_get_alignment(buf);
+	const auto align_offset = [&]() {
+		offset = kokoro_pad_to_alignment(offset, alignment);
+	};
+
+	align_offset();
 	n_kernels_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
 	n_kernels_tensor->buffer = buf;
 	n_kernels_tensor->data = (void *)((uint8_t *) ggml_backend_buffer_get_base(buf) + offset);
@@ -896,6 +935,7 @@ void kokoro_model::post_load_assign() {
 	ggml_backend_tensor_set(n_kernels_tensor, &nker, 0, size);
 	offset += size;
 
+	align_offset();
 	sqrt_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
 	sqrt_tensor->buffer = buf;
    	sqrt_tensor->data = (void *)((uint8_t *) ggml_backend_buffer_get_base(buf) + offset);
@@ -913,16 +953,18 @@ void kokoro_model::post_load_assign() {
 		for (int i = 0; i < rnn->cells.size(); i++) {
 			struct ggml_tensor * h = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
 			struct ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+			align_offset();
 			h->buffer = buf;
     		h->data = (void *)((uint8_t *) ggml_backend_buffer_get_base(buf) + offset);
     		size_t size = ggml_nbytes(h);
 			ggml_backend_tensor_set(h, data.data(), 0, size);
 			ggml_format_name(h, "lstm%d_hidden", l);
     		offset += size;
+			align_offset();
 			s->buffer = buf;
     		s->data = (void *)((uint8_t *) ggml_backend_buffer_get_base(buf) + offset);
 			ggml_backend_tensor_set(s, data.data(), 0, size);
-			ggml_format_name(h, "lstm%d_state", l);
+			ggml_format_name(s, "lstm%d_state", l);
     		offset += size;
     		rnn->hidden.push_back(h);
     		rnn->states.push_back(s);
@@ -934,6 +976,7 @@ void kokoro_model::post_load_assign() {
 		generator_window_data.clear();
 		generator_window_data.reserve(true_n_fft);
 		hann_window(true_n_fft, generator_window_data);
+		align_offset();
 		decoder->generator->window = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, true_n_fft);
 		decoder->generator->window->buffer = buf;
 		decoder->generator->window->data = (void *)((uint8_t *) ggml_backend_buffer_get_base(buf) + offset);
@@ -945,6 +988,7 @@ void kokoro_model::post_load_assign() {
 		TTS_ABORT("Window of type %s is not supported.", window.c_str());
 	}
 
+	align_offset();
 	harmonic_sampling_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, harmonic_num + 1);
 	harmonic_sampling_norm->buffer = buf;
 	harmonic_sampling_norm->data = (void *)((uint8_t *) ggml_backend_buffer_get_base(buf) + offset);
@@ -958,6 +1002,7 @@ void kokoro_model::post_load_assign() {
 	hdata.clear();
 	offset += hsize;
 
+	align_offset();
 	sampling_factor_scalar = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
 	sampling_factor_scalar->buffer = buf;
    	sampling_factor_scalar->data = (void *)((uint8_t *) ggml_backend_buffer_get_base(buf) + offset);

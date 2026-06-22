@@ -122,7 +122,7 @@ void parler_tts_model::prep_cross_key_values(int n_threads, struct tts_response 
         bufs = {backend_cpu_buffer};
         backs = {backend_cpu};
     }
-    ggml_backend_sched_t sched = ggml_backend_sched_new(backs.data(), bufs.data(), backs.size(), max_cross_nodes*n_layers, false);
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backs.data(), bufs.data(), backs.size(), max_cross_nodes*n_layers, false, false);
     
     std::vector<uint8_t> buf_compute_meta;
     buf_compute_meta.resize(max_cross_nodes*n_layers*ggml_tensor_overhead() + ggml_graph_overhead_custom(max_cross_nodes*n_layers, false));

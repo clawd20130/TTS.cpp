@@ -73,7 +73,7 @@ std::vector<float> run_case(ggml_backend_t backend, const conv_case & c) {
     ggml_context * ctx = ggml_init(params);
     ggml_tensor * kernel = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.k, c.cout, c.cin);
     ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.length, c.cin);
-    ggml_tensor * output = ggml_conv_transpose_1d(ctx, kernel, input, c.stride, c.padding, 1, 0, c.groups);
+    ggml_tensor * output = ggml_conv_transpose_1d_ex(ctx, kernel, input, c.stride, c.padding, 1, 0, c.groups);
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);

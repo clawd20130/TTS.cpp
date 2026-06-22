@@ -85,14 +85,15 @@ float round_to_float(double v) {
 
 struct ggml_tensor * reciprocal(ggml_context * ctx, struct ggml_tensor * x) {
     TTS_ASSERT(x->ne[0] == 1);
-    return ggml_reciprocal(ctx, x);
+    struct ggml_tensor * one = ggml_repeat(ctx, ggml_new_f32(ctx, 1.0f), x);
+    return ggml_div(ctx, one, x);
 }
 
 // Described in https://arxiv.org/abs/2006.08195
 // Snake1d is a common tunable activation function used in the DAC model.
 struct ggml_tensor * snake_1d(ggml_context * ctx, struct ggml_tensor * alpha, struct ggml_tensor * a) {
     assert(a->ne[2] == 1 && a->ne[3] == 1);
-    return ggml_add(ctx, a, ggml_mul(ctx, ggml_sqr(ctx, ggml_sin(ctx, ggml_mul(ctx, a, alpha))), reciprocal(ctx, alpha)));
+    return ggml_add(ctx, a, ggml_div(ctx, ggml_sqr(ctx, ggml_sin(ctx, ggml_mul(ctx, a, alpha))), alpha));
 }
 
 bool has_suffix(std::string value, std::string suffix) {

@@ -6,6 +6,7 @@
 #include "common.h"
 #include "ggml-iterator.h"
 #include "ggml.h"
+#include "gguf.h"
 #include "llama-mmap.h"
 
 static unordered_map<string_view, reference_wrapper<const tts_model_loader>> LOADERS;

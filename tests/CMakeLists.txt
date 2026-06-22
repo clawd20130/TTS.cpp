@@ -51,3 +51,8 @@ add_executable(kokoro-lstm-scan-test
         kokoro_lstm_scan.cpp
 )
 target_link_libraries(kokoro-lstm-scan-test tts)
+
+add_executable(kokoro-lstm-step-test
+        kokoro_lstm_step.cpp
+)
+target_link_libraries(kokoro-lstm-step-test tts)

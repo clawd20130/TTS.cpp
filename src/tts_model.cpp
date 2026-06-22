@@ -261,11 +261,11 @@ void runner_context::build_schedule(size_t max_nodes) {
         backend_buffer = tts_backend_get_buffer_type(backend);
         std::vector<ggml_backend_buffer_type_t> bufs = {backend_buffer, backend_cpu_buffer};
         std::vector<ggml_backend_t> backs = {backend, backend_cpu};
-        sched = ggml_backend_sched_new(backs.data(), bufs.data(), 2, max_nodes, false);
+        sched = ggml_backend_sched_new(backs.data(), bufs.data(), 2, max_nodes, false, false);
     } else {
         std::vector<ggml_backend_buffer_type_t> bufs = {backend_cpu_buffer};
         std::vector<ggml_backend_t> backs = {backend_cpu};
-        sched = ggml_backend_sched_new(backs.data(), bufs.data(), 1, max_nodes, false);
+        sched = ggml_backend_sched_new(backs.data(), bufs.data(), 1, max_nodes, false, false);
     }
 }
 

@@ -173,6 +173,23 @@ in the layout consumed by the next Conv1D, avoid materialized `IM2COL` where a
 tiled implicit-GEMM kernel can win, and avoid fusing across a boundary that
 forces uncoalesced reads.
 
+Two follow-up negative checks on the current post-`transpose_cont_2d_f32` tree
+are worth keeping explicit:
+
+- A specialized contiguous unary shader for `SQR`, `SIN`, and `RECIPROCAL`
+  preserved PCM exactly (`max_abs=0`) but did not improve synthesis. Same-binary
+  A/B on the 78-token Japanese IPA sample measured generate
+  `compute_submit_ms` around `671.9/682.4 ms` with the specialization enabled
+  versus `671.3/675.2 ms` disabled. The profiling build also showed the targeted
+  buckets unchanged in practice: `RECIPROCAL: 48 x 0.044 ms`, `SIN: 50 x
+  0.32 ms`, `SQR: 48 x 0.323 ms`. This confirms that isolated unary
+  specialization is not a meaningful path.
+- RADV diagnostics were also neutral or worse on the same sample. Default
+  generate `compute_submit_ms` was `675.1/680.5 ms`; `RADV_PERFTEST=nogttspill`
+  measured `668.3/678.1 ms`, while `cswave32` and `cswave32,nogttspill` were
+  slower (`709-730 ms`). PCM stayed byte-identical for all modes, so these are
+  safe diagnostics but not product-level fixes.
+
 The ConvTranspose1D Vulkan shader now has a more meaningful kernel-level fix.
 The previous shader computed each `(out_t, out_channel)` by scanning every input
 time step and discarding almost all of them with a bounds check. For stride-10
@@ -304,6 +321,32 @@ CONT out=[4620,256,1,1]: 25
 That makes exact layout-copy optimization the next low-risk target: improve the
 generic or specialized Vulkan `CONT`/copy path for these stable transpose/cont
 patterns before attempting a numerically different fused generator block.
+
+The current Conv1D microbench reinforces the same boundary. The existing
+`KOKORO_CONV_1D` shader maps one output element to one invocation and serially
+scans `in_channels * kernel`, so it is much slower than the optimized default
+`IM2COL + MUL_MAT` path. On the Radeon 780M, representative medians were:
+
+```text
+res0-k7-d3:  Vulkan im2col 1.587 ms, direct fused 11.752 ms
+res0-k11-d5: Vulkan im2col 2.421 ms, direct fused 14.463 ms
+res1-k7-d3:  Vulkan im2col 2.706 ms, direct fused 15.770 ms
+res1-k11-d5: Vulkan im2col 4.098 ms, direct fused 19.712 ms
+```
+
+The perf build decomposes the default hot cases further:
+
+```text
+res1-k7-d3:  IM2COL 1.03 ms, MUL_MAT m=6841 n=128 k=896  1.71 ms
+res1-k11-d5: IM2COL 1.52 ms, MUL_MAT m=6841 n=128 k=1408 2.65 ms
+post-k7:     IM2COL 1.04 ms, MUL_MAT m=6841 n=22  k=896  0.56 ms
+```
+
+This means the next useful Conv1D work should either keep the backend's matrix
+kernel strength and reduce surrounding dispatch/copy overhead, or implement a
+tiled implicit-GEMM convolution that is directly benchmarked against these
+`IM2COL + MUL_MAT` numbers. The existing scalar direct shader should remain a
+correctness probe only.
 
 ## Source-Level Layout Map
 
@@ -678,6 +721,60 @@ after generator work. Potential later work:
 - pack input/recurrent gate weights for Vulkan;
 - use one dispatch per direction/layer;
 - keep recurrent state in registers/shared memory where possible.
+
+### Phase 5b: LSTM pointwise-step fusion
+
+Added a narrower opt-in LSTM fusion behind `KOKORO_FUSE_LSTM_STEP=1`. Unlike
+`KOKORO_FUSE_LSTM_SCAN=1`, this keeps the recurrent matmul on the existing
+ggml/Vulkan matmul path and only fuses one step of gate activation plus `h/c`
+state update:
+
+```text
+[4H] input gate + [4H] recurrent matmul + [4H] recurrent bias + [H] c_prev
+  -> [H, 2] where column 0 is h and column 1 is c
+```
+
+Accuracy notes:
+
+- `kokoro-lstm-step-test` passes CPU reference, Vulkan step, and Vulkan
+  expanded-vs-step cases up to `hidden=256, seq=78`.
+- Initial non-`precise` shader output was not full-graph equivalent
+  (`max_abs=1648`, `rmse=87.5`, `27.8 dB` SNR on the Japanese benchmark WAV).
+- Marking the shader's gate/state arithmetic as `precise` restored byte-identical
+  PCM against the default path on repeated seeded full-graph runs:
+  `max_abs=0`, `rmse=0`, infinite SNR.
+
+Measured default build behavior on the 78-token Japanese phoneme benchmark:
+
+```text
+default:
+  duration nodes=15560, generate nodes=16704
+  generate compute_submit_ms=684.523, 675.191
+  generate total_ms=815.150, 798.604
+
+KOKORO_FUSE_LSTM_STEP=1:
+  duration nodes=4320, generate nodes=5576
+  generate compute_submit_ms=718.799, 660.945
+  generate total_ms=795.090, 739.318
+```
+
+The default-runtime compute result is noisy: node count and build/allocation
+drop substantially, duration compute improves, and total time improves in the
+second run, but generate compute is not consistently lower because the generator
+is now dominated by larger matmul/IM2COL/Conv/post-processing kernels.
+
+With `GGML_VK_SUBMIT_COUNT=1` in the perf build, which magnifies per-op dispatch
+cost, the benefit is clear:
+
+```text
+default generate compute_submit_ms=1464.39
+KOKORO_FUSE_LSTM_STEP=1 generate compute_submit_ms=992.519
+```
+
+The step op is therefore useful as an accuracy-safe opt-in diagnostic and may be
+worth keeping for lower graph build/allocation cost, but it does not solve the
+main default-runtime generator bottleneck. Do not enable it by default until it
+has more varied text coverage and a larger benchmark set.
 
 ### Phase 6: runtime hygiene after graph/kernel wins
 
