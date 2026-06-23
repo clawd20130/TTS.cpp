@@ -23,6 +23,7 @@ void kokoro_register();
 void orpheus_register();
 void parler_register();
 void style_bert_vits2_register();
+void style_bert_vits2_jp_bert_register();
 
 [[maybe_unused]] static bool loaders = [] {
     dia_register();
@@ -33,6 +34,7 @@ void style_bert_vits2_register();
     orpheus_register();
     parler_register();
     style_bert_vits2_register();
+    style_bert_vits2_jp_bert_register();
     return true;
 }();
 

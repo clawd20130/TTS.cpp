@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+
+import argparse
+from pathlib import Path
+from os.path import dirname, isdir
+
+from tts_encoders import StyleBertVits2JpBertEncoder
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--save-path", type=str, required=True, help="The path to save the converted JP BERT GGUF model.")
+    parser.add_argument(
+        "--bert-dir",
+        type=str,
+        required=True,
+        help="Directory containing config.json, vocab.txt, tokenizer files, and pytorch_model.bin.",
+    )
+    parser.add_argument(
+        "--max-layers",
+        type=int,
+        default=None,
+        help="Debug option: export only the first N DeBERTa layers.",
+    )
+    parser.add_argument("--never-make-dirs", default=False, action="store_true", help="Never create output directories.")
+    return parser.parse_known_args()
+
+
+if __name__ == "__main__":
+    args, _ = parse_arguments()
+    if not isdir(dirname(args.save_path)) and args.never_make_dirs:
+        raise ValueError(f"model path, {args.save_path} is not a valid path.")
+    StyleBertVits2JpBertEncoder(
+        args.save_path,
+        bert_dir=Path(args.bert_dir).expanduser(),
+        max_layers=args.max_layers,
+    ).write()

@@ -35,3 +35,8 @@ try:
     from .style_bert_vits2_gguf_encoder import *
 except ModuleNotFoundError:
     pass
+
+try:
+    from .style_bert_vits2_jp_bert_gguf_encoder import *
+except ModuleNotFoundError:
+    pass

@@ -72,6 +72,16 @@ add_executable(style-bert-vits2-decoder-backend-compare
 )
 target_link_libraries(style-bert-vits2-decoder-backend-compare tts)
 
+add_executable(style-bert-vits2-jp-bert-loader-fixture-test
+        style_bert_vits2_jp_bert_loader_fixture.cpp
+)
+target_link_libraries(style-bert-vits2-jp-bert-loader-fixture-test tts)
+
+add_executable(style-bert-vits2-jp-bert-feature-fixture-test
+        style_bert_vits2_jp_bert_feature_fixture.cpp
+)
+target_link_libraries(style-bert-vits2-jp-bert-feature-fixture-test tts)
+
 add_executable(style-bert-vits2-text-encoder-input-fixture-test
         style_bert_vits2_text_encoder_input_fixture.cpp
 )

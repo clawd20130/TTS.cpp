@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -14,6 +15,19 @@ extern const struct style_bert_vits2_model_loader final : tts_model_loader {
     unique_ptr<tts_generation_runner> from_file(gguf_context * meta_ctx, ggml_context * weight_ctx, int n_threads,
                                                 bool cpu_only, const generation_configuration & config) const override;
 } style_bert_vits2_loader;
+
+inline float style_bert_vits2_ctx_size_offset() {
+    const char * value = std::getenv("STYLE_BERT_VITS2_CTX_SIZE_OFFSET");
+    if (!value || !value[0]) {
+        return 4.0f;
+    }
+    char * end = nullptr;
+    const float parsed = std::strtof(value, &end);
+    if (end != value && parsed >= 2.0f) {
+        return parsed;
+    }
+    return 4.0f;
+}
 
 struct style_bert_vits2_conv1d {
     ggml_tensor * weight = nullptr;
@@ -208,7 +222,7 @@ struct style_bert_vits2_model : tts_model {
     void setup_from_file(gguf_context * meta_ctx, ggml_context * load_context, bool cpu_only = true) {
         prep_constants(meta_ctx);
         prep_layers(meta_ctx);
-        tts_model::setup_from_file(meta_ctx, load_context, cpu_only, "style_bert_vits2", 2.0);
+        tts_model::setup_from_file(meta_ctx, load_context, cpu_only, "style_bert_vits2", style_bert_vits2_ctx_size_offset());
     }
 };
 
@@ -260,8 +274,8 @@ struct style_bert_vits2_context : runner_context {
     ggml_tensor * flow_y_mask = nullptr;
     ggml_tensor * flow_g = nullptr;
 
-    void build_schedule() {
-        runner_context::build_schedule(std::max<size_t>(model->max_nodes(), 400000));
+    void build_schedule(size_t max_nodes = 400000) {
+        runner_context::build_schedule(std::max<size_t>(model->max_nodes(), max_nodes));
     }
 };
 

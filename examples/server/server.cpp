@@ -18,6 +18,7 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
@@ -28,12 +29,14 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
 #include "../../src/models/loaders.h"
 #include "../../src/models/style_bert_vits2/model.h"
+#include "../../src/models/style_bert_vits2_jp_bert/model.h"
 #include "args.h"
 #include "audio_file.h"
 #include "common.h"
@@ -65,6 +68,7 @@ enum task_type {
     STYLE_BERT_VITS2_DECODE,
     STYLE_BERT_VITS2_SYNTHESIZE_LATENT,
     STYLE_BERT_VITS2_SYNTHESIZE_FRONT,
+    STYLE_BERT_VITS2_JP_BERT_FEATURES,
 };
 
 using json = nlohmann::ordered_json;
@@ -184,6 +188,9 @@ struct simple_server_task {
     std::vector<int32_t> style_bert_tone_ids;
     std::vector<int32_t> style_bert_language_ids;
     std::vector<float> style_bert_bert;
+    std::vector<int32_t> style_bert_jp_bert_input_ids;
+    std::vector<float> style_bert_jp_bert_features;
+    uint32_t style_bert_jp_bert_hidden_size = 0;
     uint32_t style_bert_tokens = 0;
     int32_t style_bert_speaker_id = 0;
     int32_t style_bert_style_id = 0;
@@ -583,6 +590,55 @@ struct worker {
                 response_map->push(task);
                 break;
             }
+            case STYLE_BERT_VITS2_JP_BERT_FEATURES: {
+                auto * jp_bert_runner = dynamic_cast<style_bert_vits2_jp_bert_runner *>(&runner);
+                if (!jp_bert_runner) {
+                    task->message = "Selected model is not a Style-Bert-VITS2 JP BERT GGML model.";
+                    response_map->push(task);
+                    break;
+                }
+                const uint32_t tokens = (uint32_t) task->style_bert_jp_bert_input_ids.size();
+                if (tokens == 0) {
+                    task->message = "Style-Bert JP BERT input_ids must not be empty.";
+                    response_map->push(task);
+                    break;
+                }
+                for (size_t i = 0; i < task->style_bert_jp_bert_input_ids.size(); ++i) {
+                    const int32_t token_id = task->style_bert_jp_bert_input_ids[i];
+                    if (token_id < 0 || (uint32_t) token_id >= jp_bert_runner->model->vocab_size) {
+                        task->message = std::format(
+                            "Style-Bert JP BERT input_ids[{}]={} is outside vocab_size {}.",
+                            i,
+                            token_id,
+                            jp_bert_runner->model->vocab_size);
+                        response_map->push(task);
+                        return;
+                    }
+                }
+                if (tokens > jp_bert_runner->model->max_position_embeddings) {
+                    task->message = std::format(
+                        "Style-Bert JP BERT input_ids length {} exceeds max_position_embeddings {}.",
+                        tokens,
+                        jp_bert_runner->model->max_position_embeddings);
+                    response_map->push(task);
+                    break;
+                }
+                jp_bert_runner->encode_features(task->style_bert_jp_bert_input_ids.data(),
+                                                tokens,
+                                                task->style_bert_jp_bert_features);
+                task->style_bert_tokens = tokens;
+                task->style_bert_jp_bert_hidden_size = jp_bert_runner->model->hidden_size;
+                task->success = task->style_bert_jp_bert_features.size() ==
+                                (size_t) tokens * jp_bert_runner->model->hidden_size;
+                if (!task->success) {
+                    task->message = std::format(
+                        "Style-Bert JP BERT feature size mismatch: got {}, expected {}.",
+                        task->style_bert_jp_bert_features.size(),
+                        (size_t) tokens * jp_bert_runner->model->hidden_size);
+                }
+                response_map->push(task);
+                break;
+            }
         }
     }
 };
@@ -662,6 +718,24 @@ static bool base64_decode_bytes(const std::string & input, std::vector<uint8_t> 
     return true;
 }
 
+static std::string base64_encode_bytes(const uint8_t * input, size_t length) {
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string output;
+    output.reserve(((length + 2) / 3) * 4);
+    for (size_t i = 0; i < length; i += 3) {
+        const uint32_t b0 = input[i];
+        const uint32_t b1 = i + 1 < length ? input[i + 1] : 0;
+        const uint32_t b2 = i + 2 < length ? input[i + 2] : 0;
+        const uint32_t value = (b0 << 16) | (b1 << 8) | b2;
+        output.push_back(alphabet[(value >> 18) & 0x3f]);
+        output.push_back(alphabet[(value >> 12) & 0x3f]);
+        output.push_back(i + 1 < length ? alphabet[(value >> 6) & 0x3f] : '=');
+        output.push_back(i + 2 < length ? alphabet[value & 0x3f] : '=');
+    }
+    return output;
+}
+
 template <typename T>
 static bool json_binary_array(const json & data, const std::string & key, std::vector<T> & output, std::string & error) {
     const std::string binary_key = key + "_b64";
@@ -734,6 +808,140 @@ static bool json_int_array(const json & data, const std::string & key, std::vect
     if (output.empty()) {
         error = std::format("the '{}' field must not be empty.", key);
         return false;
+    }
+    return true;
+}
+
+static bool json_string_array(const json & data, const std::string & key, std::vector<std::string> & output, std::string & error) {
+    if (!data.contains(key) || !data.at(key).is_array()) {
+        error = std::format("the '{}' field is required and must be an array.", key);
+        return false;
+    }
+    output.clear();
+    output.reserve(data.at(key).size());
+    for (const auto & item : data.at(key)) {
+        if (!item.is_string()) {
+            error = std::format("the '{}' field must contain only strings.", key);
+            return false;
+        }
+        output.push_back(item.get<std::string>());
+    }
+    if (output.empty()) {
+        error = std::format("the '{}' field must not be empty.", key);
+        return false;
+    }
+    return true;
+}
+
+static const std::array<std::string_view, 112> STYLE_BERT_VITS2_SYMBOLS = {
+    "_", "AA", "E", "EE", "En", "N", "OO", "V", "a", "a:", "aa", "ae", "ah", "ai", "an", "ang",
+    "ao", "aw", "ay", "b", "by", "c", "ch", "d", "dh", "dy", "e", "e:", "eh", "ei", "en", "eng",
+    "er", "ey", "f", "g", "gy", "h", "hh", "hy", "i", "i0", "i:", "ia", "ian", "iang", "iao", "ie",
+    "ih", "in", "ing", "iong", "ir", "iu", "iy", "j", "jh", "k", "ky", "l", "m", "my", "n", "ng",
+    "ny", "o", "o:", "ong", "ou", "ow", "oy", "p", "py", "q", "r", "ry", "s", "sh", "t", "th",
+    "ts", "ty", "u", "u:", "ua", "uai", "uan", "uang", "uh", "ui", "un", "uo", "uw", "v", "van",
+    "ve", "vn", "w", "x", "y", "z", "zh", "zy", "!", "?", "…", ",", ".", "'", "-", "SP", "UNK",
+};
+
+static const std::unordered_map<std::string, int32_t> & style_bert_vits2_symbol_to_id() {
+    static const std::unordered_map<std::string, int32_t> map = [] {
+        std::unordered_map<std::string, int32_t> values;
+        values.reserve(STYLE_BERT_VITS2_SYMBOLS.size());
+        for (size_t i = 0; i < STYLE_BERT_VITS2_SYMBOLS.size(); ++i) {
+            values.emplace(std::string(STYLE_BERT_VITS2_SYMBOLS[i]), (int32_t) i);
+        }
+        return values;
+    }();
+    return map;
+}
+
+static bool style_bert_vits2_language_settings(const std::string & language,
+                                               int32_t & language_id,
+                                               int32_t & tone_start,
+                                               int32_t & max_raw_tone,
+                                               std::string & error) {
+    std::string normalized = language;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
+        return (char) std::toupper(c);
+    });
+    if (normalized == "ZH") {
+        language_id = 0;
+        tone_start = 0;
+        max_raw_tone = 5;
+        return true;
+    }
+    if (normalized == "JP") {
+        language_id = 1;
+        tone_start = 6;
+        max_raw_tone = 1;
+        return true;
+    }
+    if (normalized == "EN") {
+        language_id = 2;
+        tone_start = 8;
+        max_raw_tone = 3;
+        return true;
+    }
+    error = std::format("unsupported Style-Bert language '{}'; expected ZH, JP, or EN.", language);
+    return false;
+}
+
+static bool style_bert_vits2_symbols_to_ids(const std::vector<std::string> & phones,
+                                            const std::vector<int32_t> & raw_tones,
+                                            const std::string & language,
+                                            bool add_blank,
+                                            std::vector<int32_t> & phone_ids,
+                                            std::vector<int32_t> & tone_ids,
+                                            std::vector<int32_t> & language_ids,
+                                            std::string & error) {
+    if (phones.size() != raw_tones.size()) {
+        error = std::format("phones and tones must have the same length: phones={}, tones={}.", phones.size(), raw_tones.size());
+        return false;
+    }
+    int32_t language_id = 0;
+    int32_t tone_start = 0;
+    int32_t max_raw_tone = 0;
+    if (!style_bert_vits2_language_settings(language, language_id, tone_start, max_raw_tone, error)) {
+        return false;
+    }
+
+    const auto & symbol_to_id = style_bert_vits2_symbol_to_id();
+    const size_t output_size = add_blank ? phones.size() * 2 + 1 : phones.size();
+    phone_ids.clear();
+    tone_ids.clear();
+    language_ids.clear();
+    phone_ids.reserve(output_size);
+    tone_ids.reserve(output_size);
+    language_ids.reserve(output_size);
+
+    const auto append_blank = [&]() {
+        phone_ids.push_back(0);
+        tone_ids.push_back(0);
+        language_ids.push_back(0);
+    };
+    if (add_blank) {
+        append_blank();
+    }
+    for (size_t i = 0; i < phones.size(); ++i) {
+        const auto found = symbol_to_id.find(phones[i]);
+        if (found == symbol_to_id.end()) {
+            error = std::format("unknown Style-Bert phone '{}' at index {}.", phones[i], i);
+            return false;
+        }
+        if (raw_tones[i] < 0 || raw_tones[i] > max_raw_tone) {
+            error = std::format("Style-Bert {} tone at index {} must be between 0 and {}; got {}.",
+                                language,
+                                i,
+                                max_raw_tone,
+                                raw_tones[i]);
+            return false;
+        }
+        phone_ids.push_back(found->second);
+        tone_ids.push_back(raw_tones[i] + tone_start);
+        language_ids.push_back(language_id);
+        if (add_blank) {
+            append_blank();
+        }
     }
     return true;
 }
@@ -1509,6 +1717,165 @@ int main(int argc, const char ** argv) {
         res_ok_audio(res, audio, mime_type);
     };
 
+    const auto handle_style_bert_vits2_synthesize_symbols = [
+        &tqueue,
+        &rmap,
+        &res_error,
+        &res_ok_audio,
+        &model_map,
+        &default_model
+    ](const httplib::Request & req, httplib::Response & res) {
+        json data = json::parse(req.body);
+
+        std::vector<std::string> phones;
+        std::vector<int32_t> raw_tones;
+        std::vector<float> bert;
+        std::string error;
+        if (!json_string_array(data, "phones", phones, error) ||
+            !json_int_array(data, "tones", raw_tones, error) ||
+            !json_float_array(data, "bert", bert, error)) {
+            res_error(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        const std::string language = json_value<std::string>(data, "language", "JP");
+        const bool add_blank = json_value(data, "add_blank", false);
+        std::vector<int32_t> phone_ids;
+        std::vector<int32_t> tone_ids;
+        std::vector<int32_t> language_ids;
+        if (!style_bert_vits2_symbols_to_ids(phones,
+                                             raw_tones,
+                                             language,
+                                             add_blank,
+                                             phone_ids,
+                                             tone_ids,
+                                             language_ids,
+                                             error)) {
+            res_error(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        if (bert.size() != phone_ids.size() * 1024) {
+            res_error(res, format_error_response(std::format("bert must contain converted_tokens*1024 floats: got {}, expected {}.",
+                                                             bert.size(),
+                                                             phone_ids.size() * 1024),
+                                                 ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        const float sdp_ratio = json_value(data, "sdp_ratio", 0.0f);
+
+        std::string mime_type = MIMETYPE_WAV;
+        AudioFileFormat audio_type = AudioFileFormat::Wave;
+        if (data.contains("response_format") && data.at("response_format").is_string()) {
+            std::string format = data.at("response_format").get<std::string>();
+            if (format != "wav" && format != "wave" && format != "aiff") {
+                res_error(res, format_error_response("Currently 'wav' and 'aiff' are the only supported formats for the 'response_format' field.", ERROR_TYPE_NOT_SUPPORTED));
+                return;
+            } else if (format == "aiff") {
+                mime_type = MIMETYPE_AIFF;
+                audio_type = AudioFileFormat::Aiff;
+            }
+        }
+
+        struct simple_server_task * task = new simple_server_task(STYLE_BERT_VITS2_SYNTHESIZE_FRONT);
+        int id = task->id;
+        if (data.contains("model") && data.at("model").is_string()) {
+            const std::string model = data.at("model");
+            if (!model_map.contains(model)) {
+                const std::string message = std::format("Invalid Model: {0}", model);
+                res_error(res, format_error_response(message, ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            task->model = model;
+        } else {
+            task->model = default_model;
+        }
+        task->style_bert_tokens = (uint32_t) phone_ids.size();
+        task->style_bert_phone_ids = std::move(phone_ids);
+        task->style_bert_tone_ids = std::move(tone_ids);
+        task->style_bert_language_ids = std::move(language_ids);
+        task->style_bert_bert = std::move(bert);
+        task->style_bert_speaker_id = json_value(data, "speaker_id", 0);
+        task->style_bert_style_id = json_value(data, "style_id", 0);
+        task->style_bert_style_weight = json_value(data, "style_weight", 1.0f);
+        task->style_bert_sdp_ratio = sdp_ratio;
+        task->style_bert_length_scale = json_value(data, "length_scale", 1.0f);
+        task->style_bert_noise_scale = json_value(data, "noise_scale", 0.6f);
+        task->style_bert_noise_w_scale = json_value(
+            data,
+            "sdp_noise_scale",
+            json_value(data, "noise_w_scale", json_value(data, "noise_w", 0.8f)));
+
+        tqueue->push(task);
+        struct simple_server_task * rtask = rmap->get(id);
+        if (!rtask->success) {
+            res_error(res, format_error_response(rtask->message, ERROR_TYPE_SERVER));
+            return;
+        }
+
+        std::vector<uint8_t> audio;
+        bool success = write_audio_data((float *)rtask->response, rtask->length, audio, audio_type, rtask->sample_rate, 440.f, 1, true);
+        if (!success) {
+            res_error(res, format_error_response("failed to write audio data", ERROR_TYPE_SERVER));
+            return;
+        }
+        res_ok_audio(res, audio, mime_type);
+    };
+
+    const auto handle_style_bert_vits2_jp_bert_features = [
+        &tqueue,
+        &rmap,
+        &res_error,
+        &res_ok_json,
+        &model_map,
+        &default_model
+    ](const httplib::Request & req, httplib::Response & res) {
+        json data = json::parse(req.body);
+
+        std::vector<int32_t> input_ids;
+        std::string error;
+        if (!json_int_array(data, "input_ids", input_ids, error)) {
+            res_error(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        struct simple_server_task * task = new simple_server_task(STYLE_BERT_VITS2_JP_BERT_FEATURES);
+        int id = task->id;
+        if (data.contains("model") && data.at("model").is_string()) {
+            const std::string model = data.at("model");
+            if (!model_map.contains(model)) {
+                const std::string message = std::format("Invalid Model: {0}", model);
+                res_error(res, format_error_response(message, ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            task->model = model;
+        } else {
+            task->model = default_model;
+        }
+        task->style_bert_jp_bert_input_ids = std::move(input_ids);
+
+        tqueue->push(task);
+        struct simple_server_task * rtask = rmap->get(id);
+        if (!rtask->success) {
+            res_error(res, format_error_response(rtask->message, ERROR_TYPE_SERVER));
+            return;
+        }
+
+        const auto * bytes = reinterpret_cast<const uint8_t *>(rtask->style_bert_jp_bert_features.data());
+        const size_t byte_count = rtask->style_bert_jp_bert_features.size() * sizeof(float);
+        json response = {
+            {"status", "ok"},
+            {"model", rtask->model},
+            {"tokens", rtask->style_bert_tokens},
+            {"hidden_size", rtask->style_bert_jp_bert_hidden_size},
+            {"dtype", "float32"},
+            {"layout", "hidden_major"},
+            {"features_b64", base64_encode_bytes(bytes, byte_count)},
+        };
+        res_ok_json(res, response);
+    };
+
     // register API routes
     svr->Get("/", handle_index);
     svr->Get("/health", handle_health);
@@ -1516,6 +1883,8 @@ int main(int argc, const char ** argv) {
     svr->Post("/v1/style-bert-vits2/decode", handle_style_bert_vits2_decode);
     svr->Post("/v1/style-bert-vits2/synthesize-latent", handle_style_bert_vits2_synthesize_latent);
     svr->Post("/v1/style-bert-vits2/synthesize-front", handle_style_bert_vits2_synthesize_front);
+    svr->Post("/v1/style-bert-vits2/synthesize-symbols", handle_style_bert_vits2_synthesize_symbols);
+    svr->Post("/v1/style-bert-vits2/jp-bert/features", handle_style_bert_vits2_jp_bert_features);
     svr->Post("/v1/audio/conditional-prompt", handle_conditional);
     svr->Get("/v1/models", handle_models);
     svr->Get("/v1/audio/voices", handle_voices);

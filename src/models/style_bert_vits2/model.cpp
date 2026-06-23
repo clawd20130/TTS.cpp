@@ -73,6 +73,19 @@ static size_t flow_graph_node_capacity(uint32_t frames, uint32_t layers) {
     return std::max<size_t>(400000, estimated);
 }
 
+static size_t style_bert_vits2_graph_max_nodes(size_t model_max_nodes) {
+    size_t configured = 800000;
+    const char * env = std::getenv("STYLE_BERT_VITS2_GRAPH_MAX_NODES");
+    if (env && env[0]) {
+        char * end = nullptr;
+        const unsigned long long parsed = std::strtoull(env, &end, 10);
+        if (end != env && parsed >= 400000) {
+            configured = (size_t) parsed;
+        }
+    }
+    return std::max<size_t>(model_max_nodes, configured);
+}
+
 static const char * debug_output_node_name() {
     const char * env = std::getenv("STYLE_BERT_VITS2_DEBUG_OUTPUT_NODE");
     return env && env[0] ? env : nullptr;
@@ -3588,8 +3601,8 @@ style_bert_vits2_context * build_new_style_bert_vits2_context(style_bert_vits2_m
     sctx->backend = tts_backend_init_accelerator(use_cpu);
     sctx->backend_cpu = ggml_backend_cpu_init();
     sctx->set_threads();
-    sctx->build_schedule();
-    const size_t max_nodes = std::max<size_t>(model->max_nodes(), 400000);
+    const size_t max_nodes = style_bert_vits2_graph_max_nodes(model->max_nodes());
+    sctx->build_schedule(max_nodes);
     sctx->buf_compute_meta.resize(ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false));
     return sctx;
 }
