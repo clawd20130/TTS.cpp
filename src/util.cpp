@@ -123,7 +123,7 @@ struct ggml_tensor * stft(ggml_context * ctx, struct ggml_tensor * a, struct ggm
     (void) hop;
     (void) abs_and_angle;
     (void) one_sided;
-    TTS_ABORT("stft requires the legacy TTS.cpp ggml custom op port; configure with TTS_BUILD_KOKORO=ON and the support-for-tts ggml fork.\n");
+    TTS_ABORT("stft requires the TTS GGML custom op branch; configure with TTS_BUILD_KOKORO=ON and the clawd20130/ggml tts branch.\n");
 #endif
 }
 
@@ -144,7 +144,7 @@ struct ggml_tensor * istft(ggml_context * ctx, struct ggml_tensor * a, struct gg
     (void) hop;
     (void) abs_and_angle;
     (void) one_sided;
-    TTS_ABORT("istft requires the legacy TTS.cpp ggml custom op port; configure with TTS_BUILD_KOKORO=ON and the support-for-tts ggml fork.\n");
+    TTS_ABORT("istft requires the TTS GGML custom op branch; configure with TTS_BUILD_KOKORO=ON and the clawd20130/ggml tts branch.\n");
 #endif
 }
 

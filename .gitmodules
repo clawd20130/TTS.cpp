@@ -1,4 +1,4 @@
 [submodule "ggml"]
 	path = ggml
 	url = https://github.com/clawd20130/ggml.git
-	branch = kokoro-upstream-master
+	branch = tts

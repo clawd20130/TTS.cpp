@@ -6,13 +6,13 @@ running TTS GGML graphs directly through ggml backends.
 
 ## Current Baseline
 
-- This branch currently vendors a patched ggml submodule at
-  `05d4a5e4d2d4a6b9674974156fe9208b45448e82`.
+- This branch currently vendors the TTS GGML fork branch `tts` at
+  `d26df148ec9109006213e0706a193139643d100d`.
 - Upstream ggml was checked at `707321c4` (`v0.15.2`) for backend coverage.
 - The main CMake build can now point at an external/current ggml source tree
-  with `-DTTS_GGML_SOURCE_DIR=/path/to/ggml`. This keeps the bundled
-  `support-for-tts` submodule available while allowing Parler validation
-  against upstream/latest ggml.
+  with `-DTTS_GGML_SOURCE_DIR=/path/to/ggml`. The legacy `support-for-tts`
+  branch is retained only as historical reference; active TTS work should use
+  the `tts` branch in the fork.
 - TTS.cpp can be configured with `-DGGML_VULKAN=ON` and the `tts-cli` target
   links against `libvulkan.so.1`.
 - Runtime backend selection is available through `TTS_BACKEND` or `--backend`.
@@ -707,8 +707,8 @@ cmake --build build-vulkan-latest-main --target tts-cli -j$(nproc)
 ```
 
 When the selected ggml header does not expose the TTS.cpp Kokoro custom ops,
-`TTS_BUILD_KOKORO` defaults to `OFF`; the old `support-for-tts` submodule still
-defaults Kokoro to `ON`.
+`TTS_BUILD_KOKORO` defaults to `OFF`; the fork's `tts` branch exposes those ops
+and keeps Kokoro enabled by default.
 
 Parler generation was aligned with the Hugging Face implementation in three
 runtime details:

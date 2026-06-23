@@ -1,6 +1,6 @@
 ## TTS.cpp
 
-[Roadmap](https://github.com/users/mmwillet/projects/1) / [Modified GGML](https://github.com/mmwillet/ggml/tree/support-for-tts)
+[Roadmap](https://github.com/users/mmwillet/projects/1) / [TTS GGML fork](https://github.com/clawd20130/ggml/tree/tts)
 
 ### Purpose and Goals
 
@@ -52,11 +52,15 @@ Additional Model support will initially be added based on open source model perf
   * XCode Command Line Tools (via `xcode-select --install`) should suffice for OS X
 * CMake (>=3.14) 
 * GGML pulled locally
-  * this can be accomplished via `git clone -b support-for-tts git@github.com:mmwillet/ggml.git`
+  * the active TTS branch is `tts` in `https://github.com/clawd20130/ggml.git`
+  * `support-for-tts` is the legacy branch based on older GGML and should only be used as a reference
 
-#### GGML Patch
+#### GGML Branch
 
-The local GGML library includes several required patches to the main branch of GGML (making the current TTS ggml branch out of date with modern GGML). Specifically these patches include major modifications to the convolutional transposition operation as well as several new GGML operations which have been implemented for TTS specific purposes; these include `ggml_reciprocal`, `ggml_round`, `ggml_mod`, `ggml_cumsum`, STFT, and iSTFT operations.
+The active GGML customizations live on the `tts` branch of our GGML fork. That
+branch is based on official upstream GGML and carries the TTS/Kokoro-specific
+ops needed by this repository. The old `support-for-tts` branch remains useful
+for archaeology, but it is no longer the branch this repository should track.
 
 We are currently [working on upstreaming some of these operations inorder to deprecate this patch requirement going forward](https://github.com/mmwillet/TTS.cpp/issues/66).
 
