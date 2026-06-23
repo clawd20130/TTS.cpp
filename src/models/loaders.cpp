@@ -17,16 +17,22 @@ tts_model_loader::tts_model_loader(const char * arch, bool is_test) : arch{ arch
 
 void dia_register();
 void dummy_register();
+#if TTS_BUILD_KOKORO
 void kokoro_register();
+#endif
 void orpheus_register();
 void parler_register();
+void style_bert_vits2_register();
 
 [[maybe_unused]] static bool loaders = [] {
     dia_register();
     dummy_register();
+#if TTS_BUILD_KOKORO
     kokoro_register();
+#endif
     orpheus_register();
     parler_register();
+    style_bert_vits2_register();
     return true;
 }();
 

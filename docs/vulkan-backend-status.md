@@ -9,6 +9,10 @@ running TTS GGML graphs directly through ggml backends.
 - This branch currently vendors a patched ggml submodule at
   `05d4a5e4d2d4a6b9674974156fe9208b45448e82`.
 - Upstream ggml was checked at `707321c4` (`v0.15.2`) for backend coverage.
+- The main CMake build can now point at an external/current ggml source tree
+  with `-DTTS_GGML_SOURCE_DIR=/path/to/ggml`. This keeps the bundled
+  `support-for-tts` submodule available while allowing Parler validation
+  against upstream/latest ggml.
 - TTS.cpp can be configured with `-DGGML_VULKAN=ON` and the `tts-cli` target
   links against `libvulkan.so.1`.
 - Runtime backend selection is available through `TTS_BACKEND` or `--backend`.
@@ -22,6 +26,216 @@ running TTS GGML graphs directly through ggml backends.
   `CONV_TRANSPOSE_1D`, `STFT`, `AA_STFT`, `ISTFT`, and `AA_ISTFT`.
 - A real Kokoro GGUF synthesis run now works through the Vulkan backend. The
   validation model was `Kokoro_no_espeak_Q4.gguf` with `voice=af_heart`.
+
+## Style-Bert-VITS2 Decoder Vulkan Path
+
+The `style-bert-vits2` GGUF architecture currently exposes decoder inference
+for the debug backend sidecar. The Python debug backend still runs the official
+front half to produce `decoder_z` and `decoder_g`, then sends those tensors to
+TTS.cpp for GGML decoder execution on Vulkan.
+
+Style-Bert-VITS2 defaults to a Vulkan "accurate" mode because the RADV/NVIDIA
+fast matrix-core path is not waveform-equivalent enough for this decoder. The
+loader sets these defaults before initializing the Vulkan backend:
+
+```text
+GGML_VK_DISABLE_F16=1
+GGML_VK_DISABLE_COOPMAT=1
+GGML_VK_DISABLE_COOPMAT2=1
+```
+
+Set `STYLE_BERT_VITS2_VULKAN_PRECISION=fast` to opt back into the faster
+backend-default path for diagnostics only. On the local Radeon 780M fixture,
+the fast path measured `max_abs=0.00401043` against the official PyTorch
+decoder output, while the accurate path measured `max_abs=1.09207e-05` and
+`rms=7.62272e-07`.
+
+Current short-fixture decoder timing on the Radeon 780M:
+
+| Backend / mode | Decoder total | Accuracy vs PyTorch decoder |
+| --- | ---: | ---: |
+| CPU | `~421-426 ms` | `max_abs=3.04729e-06` |
+| Vulkan accurate | `~137-138 ms` | `max_abs=1.09207e-05` |
+| Vulkan fast | `~124-125 ms` | `max_abs=0.00401043` |
+
+The fixture covers `60` decoder frames and `30720` output samples. The
+`style-bert-vits2-decoder-fixture-test` tolerance is intentionally tight
+(`1e-4`) so the inaccurate fast path cannot silently pass as the default.
+
+The next front-half migration step now has a pinned fixture and a first GGML
+subgraph. `scripts/export_style_bert_vits2_frontend_fixture.py` in the debug
+backend repo exports the official PyTorch tensors for
+`phone/tone/language ids + JP BERT + style vector -> enc_input`, plus the later
+duration, alignment, flow, and decoder tensors. The GGUF converter now includes
+the TextEncoder input-layer weights and has been staged to include the remaining
+Transformer front-half weights:
+
+- token, tone, and language embeddings
+- JP BERT 1x1 projection
+- style vector linear projection
+- TextEncoder `encoder` attention, FFN, LayerNorm, relative-position, and
+  speaker-conditioning tensors
+- Transformer flow coupling tensors under `flow.flows.*`
+
+The full front-half GGUF is now generated as
+`tmp/style-bert-vits2/jvnv-F1-jp-full.gguf`. The additional tensor names use
+compact stable aliases (`te.enc.*` and `fl.*`) because this repository's current
+GGUF reader rejects tensor names at 64 bytes or longer. The full file currently
+contains `784` tensors and is about `235M`, including `110` TextEncoder encoder
+tensors and `456` flow tensors. Existing decoder-side fixtures pass against the
+full GGUF, so it can replace the older decoder-only file for the debug sidecar's
+decoder service while the remaining front-half graphs are migrated.
+
+Speaker conditioning is no longer only a Python-side fixture input.
+`style-bert-vits2-speaker-embedding-fixture-test` verifies
+`speaker_id -> g` directly from the GGUF `speaker_embedding.weight` tensor:
+
+| Backend / mode | Speaker embedding accuracy |
+| --- | ---: |
+| CPU | `max_abs=0`, `rms=0` |
+| Vulkan accurate | `max_abs=0`, `rms=0` |
+
+Style conditioning now also runs from GGUF. The official Style-Bert-VITS2
+formula is preserved exactly:
+
+```text
+style_vector = mean + (style_vectors[style_id] - mean) * style_weight
+```
+
+`style-bert-vits2-style-vector-fixture-test` verifies
+`style_id/style_weight -> style_vector` against the exported PyTorch fixture:
+
+| Backend / mode | Style vector accuracy |
+| --- | ---: |
+| CPU | `max_abs=0`, `rms=0` |
+| Vulkan accurate | `max_abs=0`, `rms=0` |
+
+`style-bert-vits2-text-encoder-input-fixture-test` verifies that first
+front-half subgraph directly against the exported PyTorch `enc_input`. Current
+local results:
+
+| Backend / mode | TextEncoder input accuracy |
+| --- | ---: |
+| CPU | `max_abs=6.86646e-05`, `rms=5.98004e-06` |
+| Vulkan accurate | `max_abs=8.39233e-05`, `rms=1.30805e-05` |
+
+The first internal TextEncoder transformer component is now pinned as a GGML
+subgraph. `style-bert-vits2-text-encoder-ffn-fixture-test` verifies layer 0
+`norm1/x_mask -> ffn` against a hook exported from the official PyTorch
+TextEncoder:
+
+| Backend / mode | TextEncoder layer 0 FFN accuracy |
+| --- | ---: |
+| CPU | `max_abs=1.43051e-06`, `rms=1.93882e-07` |
+| Vulkan accurate | `max_abs=5.72205e-06`, `rms=3.15646e-07` |
+
+The TextEncoder `MultiHeadAttention` subgraph is now implemented with the
+official relative-position key and value terms. The default
+`STYLE_BERT_VITS2_ATTENTION_MODE=values` path keeps the legacy per-query
+score/softmax accumulation order, then matrixizes the value and relative-value
+side. This is the current product default because it is materially faster than
+the first exact port while staying strict-equivalent on Vulkan:
+
+| Backend / mode | Layer-0 attention accuracy |
+| --- | ---: |
+| CPU / `values` | `max_abs=5.72205e-06`, `rms=1.09189e-06` |
+| Vulkan accurate / `values` | `max_abs=3.8147e-06`, `rms=8.34526e-07` |
+
+Diagnostic alternatives remain available through
+`STYLE_BERT_VITS2_ATTENTION_MODE=legacy|full|scores|values`.
+`legacy` preserves the first exact port. `full` matrixizes both score and value
+terms and is the fastest graph, but it is not currently strict-equivalent enough
+on Vulkan for the decoder-latent tolerance. `scores` keeps the matrixized score
+path and legacy value path, but still accumulates too much downstream error.
+Both are useful for profiling only.
+
+The deterministic duration predictor is now the second migrated front-half
+subgraph. The GGUF converter adds `duration_predictor.conv_1`, `conv_2`,
+`proj`, `cond`, and LayerNorm gamma/beta tensors, and
+`style-bert-vits2-duration-predictor-fixture-test` verifies
+`x/x_mask/g -> logw_dp` against the exported PyTorch fixture:
+
+| Backend / mode | DurationPredictor accuracy |
+| --- | ---: |
+| CPU | `max_abs=1.96695e-06`, `rms=6.87584e-07` |
+| Vulkan accurate | `max_abs=1.3113e-06`, `rms=7.09572e-07` |
+
+The TextEncoder output projection is the third migrated front-half subgraph.
+The GGUF converter adds `text_encoder.proj.weight/bias`, and
+`style-bert-vits2-text-encoder-projection-fixture-test` verifies
+`x/x_mask -> m_p/logs_p` against the exported PyTorch fixture:
+
+| Backend / mode | Projection `m_p` accuracy | Projection `logs_p` accuracy |
+| --- | ---: | ---: |
+| CPU | `max_abs=1.19209e-06`, `rms=4.57582e-08` | `max_abs=4.76837e-07`, `rms=1.03147e-07` |
+| Vulkan accurate | `max_abs=3.57628e-07`, `rms=1.84355e-08` | `max_abs=5.96046e-07`, `rms=5.55146e-08` |
+
+The duration-to-alignment bridge is also pinned. It is host-side procedural
+logic rather than a neural GGML graph, but it is required to connect duration
+outputs to decoder-frame tensors. `style-bert-vits2-alignment-fixture-test`
+verifies the official `logw/x_mask/m_p/logs_p -> w/w_ceil/y_mask/attn/
+m_p_expanded/logs_p_expanded` path:
+
+| Tensor | Accuracy vs PyTorch fixture |
+| --- | ---: |
+| `w` | `max_abs=2.38419e-07`, `rms=8.17769e-08` |
+| `w_ceil` | `max_abs=0`, `rms=0` |
+| `y_mask` | `max_abs=0`, `rms=0` |
+| `attn` | `max_abs=0`, `rms=0` |
+| `m_p_expanded` | `max_abs=0`, `rms=0` |
+| `logs_p_expanded` | `max_abs=0`, `rms=0` |
+
+The prior-sampling bridge is now a GGML subgraph. It takes
+`m_p_expanded/logs_p_expanded/noise/noise_scale -> z_p`, matching the official
+formula:
+
+```text
+z_p = m_p_expanded + noise * exp(logs_p_expanded) * noise_scale
+```
+
+`style-bert-vits2-prior-sample-fixture-test` reconstructs the fixture noise
+from the exported PyTorch `z_p` tensor and verifies that GGML reproduces it:
+
+| Backend / mode | Prior sample `z_p` accuracy |
+| --- | ---: |
+| CPU | `max_abs=2.38419e-07`, `rms=1.35638e-08` |
+| Vulkan accurate | `max_abs=4.76837e-07`, `rms=2.01557e-08` |
+
+The reverse flow and decoder-latent bridge are now also pinned. The flow path
+uses the migrated TextEncoder attention implementation above, so the strict
+fixture is the main guard against small attention-order differences becoming
+audible after the normalizing-flow stack. With the default
+`STYLE_BERT_VITS2_ATTENTION_MODE=values` path:
+
+| Backend / fixture | Accuracy vs exported PyTorch fixture |
+| --- | ---: |
+| CPU `style-bert-vits2-flow-fixture-test` | `max_abs=2.14577e-06`, `rms=2.04656e-07` |
+| Vulkan `style-bert-vits2-flow-fixture-test` | `max_abs=1.90735e-06`, `rms=1.90314e-07` |
+| CPU `style-bert-vits2-decoder-latent-fixture-test` | `max_abs=1.90735e-06`, `rms=2.21568e-07` |
+| Vulkan `style-bert-vits2-decoder-latent-fixture-test` | `max_abs=2.02656e-06`, `rms=2.03867e-07` |
+
+On a 60-frame fixture, the original exact attention port emitted about `17450`
+nodes per flow step and measured about `264 ms` across the four reverse-flow
+steps. The rejected `full` matrix path emitted about `1286` nodes per step and
+measured about `61 ms`, but failed the strict Vulkan latent gate. The default
+`values` mode emits about `11186` nodes per step and measures about `185 ms`,
+which is a smaller speedup but keeps the strict-equivalence gate intact.
+
+The persistent debug path now routes Style-Bert-VITS2 phones/tones through the
+local GGML sidecar. A representative 68-phone Japanese sentence measured
+`decoder_seconds` around `2.45s` for about `5.9s` of audio (`~0.53 RTF`) on the
+local Radeon 780M Vulkan path. The previous comparable path measured about
+`4.23s` in the decoder (`~0.82 RTF`), so the attention-value matrixization is a
+real improvement while preserving fixture precision.
+
+The server also exposes `/v1/style-bert-vits2/synthesize-front` for a stricter
+GGML front-half path when `sdp_ratio=0`. That endpoint accepts Style-Bert phone,
+tone, language, and BERT feature tensors from the debug sidecar, then runs
+speaker embedding, style vector, TextEncoder, deterministic duration prediction,
+alignment, prior sample, reverse flow, and decoder in TTS.cpp. It intentionally
+rejects non-zero `sdp_ratio`; the stochastic duration predictor has not been
+migrated yet, so the default Style-Bert prosody path must continue to use
+`/v1/style-bert-vits2/synthesize-latent` for accuracy.
 
 ## K8 iGPU Performance Target
 
@@ -451,6 +665,101 @@ Additional real-model strict Vulkan smoke tests:
 | --- | --- | --- | ---: |
 | Dia `Dia_Q4_DAC_F16.gguf` | `--prompt '[S1] Hello.' --topk 35 --temperature 1.3 --max-tokens 32` | `7680` frames / `0.17415s` at 44.1 kHz | `3034.33 ms` |
 | Parler `Parler_TTS_mini_Q5.gguf` | `--prompt 'Hello world.' --max-tokens 32` | `10240` frames / `0.2322s` at 44.1 kHz | `865.60 ms` |
+| Japanese Parler `Japanese_Parler_TTS_mini_F32.gguf` | `--prompt '赤い[あかい]血[ち]は白い[しろい]雪[ゆき]' --topk 1 --max-tokens 32` on Radeon 780M | `12288` frames / `0.27864s` at 44.1 kHz | `1974.14 ms` |
+
+Japanese Parler was converted from `2121-8/japanese-parler-tts-mini` using the
+model's split tokenizers: `prompt_tokenizer` for the synthesized Japanese text
+and `description_tokenizer` for the voice-conditioning T5 encoder. The generated
+F32 GGUF was `2.0G` with `524` tensors. Greedy CPU vs Radeon 780M Vulkan checks
+for 12 and 32 max-token runs produced identical raw and filtered Parler audio
+tokens; the WAV comparison was same-length with `max_abs=1` PCM sample error and
+`rmse` around `0.136`, which is effectively 16-bit rounding noise.
+
+The main project was then configured against upstream ggml `0.15.2` through
+`TTS_GGML_SOURCE_DIR` and the minimal TTS patches needed by Japanese Parler.
+The patch against upstream ggml is tracked at
+`ggml-patches/latest-ggml-parler.patch` and currently covers:
+
+- Include the split `gguf.h` API.
+- Pass the new scheduler `op_offload` argument.
+- Keep Parler/DAC `conv_1d` im2col output in F32 when both kernel and input are
+  F32.
+- Allow `conv_transpose_1d` to honor non-zero padding in CPU and Vulkan.
+- Use direct `sin(x * alpha)^2 / alpha` in Snake1D instead of a reciprocal op.
+
+The patch is in normal `git apply` format and was checked against a clean
+`ggml-org/ggml` checkout at `707321c4` with:
+
+```bash
+git -C /home/kevinzhow/github/ggml apply --check \
+  /home/kevinzhow/github/TTS.cpp/ggml-patches/latest-ggml-parler.patch
+```
+
+Validated main-project latest-ggml build:
+
+```bash
+cmake -S . -B build-vulkan-latest-main \
+  -DGGML_VULKAN=ON \
+  -DTTS_GGML_SOURCE_DIR=$PWD/tmp/latest-ggml-probe/ggml \
+  -DTTS_BUILD_EXAMPLES=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-vulkan-latest-main --target tts-cli -j$(nproc)
+```
+
+When the selected ggml header does not expose the TTS.cpp Kokoro custom ops,
+`TTS_BUILD_KOKORO` defaults to `OFF`; the old `support-for-tts` submodule still
+defaults Kokoro to `ON`.
+
+Parler generation was aligned with the Hugging Face implementation in three
+runtime details:
+
+- The first decoder step can run as `prompt_hidden_states + BOS audio` in one
+  batch, matching the official cache-position shape.
+- Multi-position decoder logits are deinterleaved from ggml's `[vocab, seq,
+  heads]` tensor layout into the runtime's position-major logits buffer before
+  sampling.
+- The Parler EOS logits processor is applied before sampling, and raw delayed
+  EOS tokens no longer freeze later codebook inputs. When the selected ggml
+  exposes `ggml_gelu_erf`, Parler uses erf GELU to match Transformers'
+  `activation_function="gelu"` more closely; older ggml forks fall back to
+  `ggml_gelu`.
+- Decoder inputs also reproduce the Hugging Face delayed-pattern tail. As
+  generation approaches `max_length`, each codebook input is forced to
+  `pad/eos` on its offset diagonal instead of feeding the previous raw token.
+  This fixed the earlier step-25/head-3 divergence on the 32-token Japanese
+  parity sample.
+
+Upstream ggml uses `GGML_MAX_NAME=64`, while the previous DAC tensor names hit
+exactly `64` bytes, for example
+`audio_encoder.decoder_block.1.residual_unit.0.res.initial.weight`. New Parler
+GGUF exports shorten only the non-semantic residual-unit label to `ru.N`; the
+runtime still accepts older names because it parses the numeric unit index.
+The regenerated file `Japanese_Parler_TTS_mini_F32_latestnames.gguf` has
+`524` tensors and max tensor-name length `53`.
+
+Main-project latest-ggml results on the same Japanese 32-token greedy sample:
+
+| Runtime | Total time | Audio length | RTF | PCM vs latest CPU |
+| --- | ---: | ---: | ---: | ---: |
+| Latest ggml CPU | `5229.72 ms` | `0.27864s` | `18.77` | reference |
+| Latest ggml Vulkan / Radeon 780M | `1618.29 ms` | `0.27864s` | `5.81` | `max_abs=1`, `rmse=0.132` |
+| Current patched ggml Vulkan / Radeon 780M | `1790.83 ms` | `0.27864s` | `6.43` | `max_abs=1`, `rmse=0.131` |
+
+The latest-ggml CPU, latest-ggml Vulkan, current patched-ggml Vulkan, and
+Hugging Face CUDA reference for `2121-8/japanese-parler-tts-mini` now produce
+identical filtered Parler/DAC audio-token streams (`216 / 216` codes). WAV
+output is same-length (`12288` PCM samples at 44.1 kHz); versus the CUDA
+reference, latest CPU had `max_abs=1`, `rmse=0.1629`, and latest Vulkan had
+`max_abs=1`, `rmse=0.1747`. CPU/Vulkan parity is therefore strong and the
+previous CUDA/GGML step-25 tail divergence is fixed.
+
+The older English `Parler_TTS_mini_Q5.gguf` is useful as a backend smoke test
+but not as a strict equivalence proof. In a 32-token greedy CPU/Vulkan check, the
+filtered audio-token stream first diverged at index `44`, leading to large PCM
+differences despite matching duration. The same 12-token check kept identical
+filtered tokens and only `max_abs=1` PCM difference. Treat Q5 autoregressive
+comparisons as argmax-sensitivity probes, and use F32 GGUF for correctness
+baselines before quantized performance work.
 
 ## Remaining Backend Gaps
 

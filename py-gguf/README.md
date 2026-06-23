@@ -22,7 +22,26 @@ The GGUF conversion script for Parler TTS can be run via the `convert_parler_tts
 python3 ./convert_parler_tts_to_gguf --save-path ./parler-tts-large.gguf --voice-prompt "female voice" --large-model
 ```
 
-the command accepts _--save-path_ which described where to save the GGUF model file to, the flag _--large-model_ which when passed encodes [Parler-TTS-large](https://huggingface.co/parler-tts/parler-tts-large-v1) (rather than [mini](https://huggingface.co/parler-tts/parler-tts-mini-v1)), _--voice-prompt_ which is a sentence or statement that desribes how the model's voice should sound at generation time, and _--repo-id-override_ which override the huggingface repository to pull the model tensors from (this setting overrides the _--large-model_ argument). 
+the command accepts _--save-path_ which described where to save the GGUF model file to, the flag _--large-model_ which when passed encodes [Parler-TTS-large](https://huggingface.co/parler-tts/parler-tts-large-v1) (rather than [mini](https://huggingface.co/parler-tts/parler-tts-mini-v1)), _--voice-prompt_ which is a sentence or statement that desribes how the model's voice should sound at generation time, and _--repo-id-override_ which override the huggingface repository to pull the model tensors from (this setting overrides the _--large-model_ argument).
+
+Japanese Parler checkpoints such as
+[`2121-8/japanese-parler-tts-mini`](https://huggingface.co/2121-8/japanese-parler-tts-mini)
+can be converted through the same entrypoint:
+
+```commandline
+python3 ./convert_parler_tts_to_gguf \
+  --save-path ./japanese-parler-tts-mini-f32.gguf \
+  --repo-id-override 2121-8/japanese-parler-tts-mini \
+  --voice-prompt "JSUT speaks this line in a natural Japanese female voice with clear articulation and moderate pace."
+```
+
+For repositories that provide split tokenizers, the converter uses
+`prompt_tokenizer` for the text that will be synthesized and
+`description_tokenizer` for the voice-conditioning T5 encoder. Repositories that
+only provide a root tokenizer continue to use the root tokenizer for both roles.
+Newly exported DAC tensor names are kept below upstream ggml's 64-byte tensor
+name limit while retaining compatibility with the runtime's numeric layer
+parsing.
 
 #### Voice Prompt
 

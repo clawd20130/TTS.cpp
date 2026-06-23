@@ -76,7 +76,13 @@ set(GGML_FATAL_WARNINGS     ${TTS_FATAL_WARNINGS})
 
 
 # build lib
-add_subdirectory(ggml)
+set(TTS_GGML_SOURCE_DIR "" CACHE PATH "Optional external ggml source tree. Defaults to the bundled ggml submodule.")
+if (TTS_GGML_SOURCE_DIR)
+    get_filename_component(TTS_GGML_SOURCE_DIR "${TTS_GGML_SOURCE_DIR}" ABSOLUTE)
+    add_subdirectory("${TTS_GGML_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/ggml")
+else()
+    add_subdirectory(ggml)
+endif()
 add_subdirectory(ggml-patches)
 add_subdirectory(src)
 

@@ -1,7 +1,46 @@
 #include "sampler.h"
 
+#include <cstdlib>
+#include <cstdio>
+
+static int sampler_debug_topk_value(const char * name, int default_value) {
+    const char * value = std::getenv(name);
+    if (!value || !value[0]) {
+        return default_value;
+    }
+    return std::atoi(value);
+}
+
+static void sampler_debug_print_topk(float * logits, uint32_t n_output_heads, uint32_t vocab_size) {
+    static int call_index = 0;
+    const int top_k = sampler_debug_topk_value("SAMPLER_DEBUG_TOPK", 0);
+    const int max_calls = sampler_debug_topk_value("SAMPLER_DEBUG_TOPK_STEPS", 0);
+    if (top_k <= 0 || (max_calls > 0 && call_index >= max_calls)) {
+        ++call_index;
+        return;
+    }
+
+    fprintf(stderr, "SAMPLER_DEBUG_TOPK call=%d heads=%u vocab=%u\n", call_index, n_output_heads, vocab_size);
+    for (uint32_t h = 0; h < n_output_heads; ++h) {
+        std::vector<uint32_t> picks(vocab_size);
+        std::iota(picks.begin(), picks.end(), 0);
+        std::partial_sort(picks.begin(), picks.begin() + std::min((size_t) top_k, picks.size()), picks.end(),
+                [logits, h, vocab_size](uint32_t a, uint32_t b) {
+                    return logits[h * vocab_size + a] > logits[h * vocab_size + b];
+                });
+        fprintf(stderr, "SAMPLER_DEBUG_TOPK call=%d head=%u", call_index, h);
+        for (int i = 0; i < top_k && i < (int) picks.size(); ++i) {
+            const uint32_t token = picks[i];
+            fprintf(stderr, " %u:%.9g", token, logits[h * vocab_size + token]);
+        }
+        fputc('\n', stderr);
+    }
+    ++call_index;
+}
+
 void sampler::sample(float * logits, std::vector<uint32_t> & output_tokens) {
     // assume that we are pointing to the start of the first token output;
+    sampler_debug_print_topk(logits, n_output_heads, vocab_size);
     if (!do_sample) {
         return max(logits, output_tokens);
     }

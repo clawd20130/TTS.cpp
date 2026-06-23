@@ -14,12 +14,16 @@
 
 #include <signal.h>
 
+#include <algorithm>
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstddef>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <memory>
@@ -29,6 +33,7 @@
 #include <unordered_set>
 
 #include "../../src/models/loaders.h"
+#include "../../src/models/style_bert_vits2/model.h"
 #include "args.h"
 #include "audio_file.h"
 #include "common.h"
@@ -57,6 +62,9 @@ enum task_type {
     TTS,
     CONDITIONAL_PROMPT,
     VOICES,
+    STYLE_BERT_VITS2_DECODE,
+    STYLE_BERT_VITS2_SYNTHESIZE_LATENT,
+    STYLE_BERT_VITS2_SYNTHESIZE_FRONT,
 };
 
 using json = nlohmann::ordered_json;
@@ -76,16 +84,41 @@ static T json_value(const json & body, const std::string & key, const T & defaul
     }
 }
 
-bool write_audio_data(float * data, size_t length, std::vector<uint8_t> & output, AudioFileFormat format = AudioFileFormat::Wave, float sample_rate = 44100.f, float frequency = 440.f, int channels = 1) {
+bool write_audio_data(float * data,
+                      size_t length,
+                      std::vector<uint8_t> & output,
+                      AudioFileFormat format = AudioFileFormat::Wave,
+                      float sample_rate = 44100.f,
+                      float frequency = 440.f,
+                      int channels = 1,
+                      bool peak_normalize = false) {
     AudioFile<float> file;
     file.setBitDepth(16);
     file.setSampleRate(sample_rate);
     file.setNumChannels(channels);
     int samples = (int) (length / channels);
     file.setNumSamplesPerChannel(samples);
+    float scale = 1.0f;
+    if (peak_normalize) {
+        float peak = 0.0f;
+        for (size_t i = 0; i < length; ++i) {
+            const float sample = data[i];
+            if (std::isfinite(sample)) {
+                peak = std::max(peak, std::fabs(sample));
+            }
+        }
+        if (peak > 0.0f) {
+            scale = 1.0f / peak;
+        }
+    }
     for (int channel = 0; channel < channels; channel++) {
         for (int i = 0; i < samples; i++) {
-            file.samples[channel][i] = data[i];
+            const size_t index = (size_t) i * (size_t) channels + (size_t) channel;
+            float sample = index < length ? data[index] : 0.0f;
+            if (!std::isfinite(sample)) {
+                sample = 0.0f;
+            }
+            file.samples[channel][i] = sample * scale;
         }
     }
     return file.writeData(output, format);
@@ -97,6 +130,29 @@ static void log_server_request(const httplib::Request & req, const httplib::Resp
     }
 
     fprintf(stdout, "request: %s %s %s %d\n", req.method.c_str(), req.path.c_str(), req.remote_addr.c_str(), res.status);
+}
+
+static std::string env_string_or_default(const char * name, const char * fallback) {
+    const char * value = std::getenv(name);
+    return value && value[0] ? std::string(value) : std::string(fallback);
+}
+
+static bool env_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value && value[0] && std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0;
+}
+
+static json style_bert_vits2_runtime_config() {
+    const bool flow_fused = env_enabled("STYLE_BERT_VITS2_FLOW_FUSED");
+    const std::string flow_group_size = env_string_or_default("STYLE_BERT_VITS2_FLOW_GROUP_SIZE", "1");
+    return {
+        {"backend_env", env_string_or_default("TTS_BACKEND", "auto")},
+        {"device_env", env_string_or_default("TTS_DEVICE", "")},
+        {"debug_timings", env_enabled("STYLE_BERT_VITS2_DEBUG_TIMINGS")},
+        {"flow_fused", flow_fused},
+        {"flow_group_size", flow_group_size},
+        {"flow_mode", flow_fused ? "fused" : (flow_group_size == "1" ? "step" : "group")},
+    };
 }
 
 struct simple_server_task {
@@ -116,6 +172,26 @@ struct simple_server_task {
     std::chrono::time_point<std::chrono::steady_clock> time;
     float sample_rate = 44100.0f;
     std::string model;
+    std::vector<float> style_bert_decoder_z;
+    std::vector<float> style_bert_decoder_g;
+    uint32_t style_bert_decoder_frames = 0;
+    std::vector<float> style_bert_logw;
+    std::vector<float> style_bert_x_mask;
+    std::vector<float> style_bert_m_p;
+    std::vector<float> style_bert_logs_p;
+    std::vector<float> style_bert_noise;
+    std::vector<int32_t> style_bert_phone_ids;
+    std::vector<int32_t> style_bert_tone_ids;
+    std::vector<int32_t> style_bert_language_ids;
+    std::vector<float> style_bert_bert;
+    uint32_t style_bert_tokens = 0;
+    int32_t style_bert_speaker_id = 0;
+    int32_t style_bert_style_id = 0;
+    float style_bert_style_weight = 1.0f;
+    float style_bert_sdp_ratio = 0.0f;
+    float style_bert_length_scale = 1.0f;
+    float style_bert_noise_scale = 0.6f;
+    float style_bert_noise_w_scale = 0.8f;
 
     bool timed_out(int t) {
         auto now = std::chrono::steady_clock::now();
@@ -280,7 +356,7 @@ struct worker {
                 task->success = true;
                 response_map->push(task);
                 break;
-            case VOICES:
+            case VOICES: {
                 // Maybe there is a better way to pass the voices rather than
                 // needing a custom serialized message?
                 // Getting all voices
@@ -310,6 +386,203 @@ struct worker {
                 task->success = true;
                 response_map->push(task);
                 break;
+            }
+            case STYLE_BERT_VITS2_DECODE: {
+                auto * style_runner = dynamic_cast<style_bert_vits2_runner *>(&runner);
+                if (!style_runner) {
+                    task->message = "Selected model is not a Style-Bert-VITS2 GGML decoder.";
+                    response_map->push(task);
+                    break;
+                }
+                data = new tts_response;
+                style_runner->decode(task->style_bert_decoder_z.data(),
+                                     task->style_bert_decoder_g.data(),
+                                     task->style_bert_decoder_frames,
+                                     *data);
+                task->response    = (void *) data->data;
+                task->length      = data->n_outputs;
+                task->sample_rate = style_runner->sampling_rate;
+                task->success     = data->n_outputs != 0;
+                response_map->push(task);
+                break;
+            }
+            case STYLE_BERT_VITS2_SYNTHESIZE_LATENT: {
+                auto * style_runner = dynamic_cast<style_bert_vits2_runner *>(&runner);
+                if (!style_runner) {
+                    task->message = "Selected model is not a Style-Bert-VITS2 GGML model.";
+                    response_map->push(task);
+                    break;
+                }
+                const size_t expected_tokens = task->style_bert_tokens;
+                const size_t expected_text =
+                    (size_t) style_runner->model->inter_channels * expected_tokens;
+                if (expected_tokens == 0 ||
+                    task->style_bert_logw.size() != expected_tokens ||
+                    task->style_bert_x_mask.size() != expected_tokens ||
+                    task->style_bert_m_p.size() != expected_text ||
+                    task->style_bert_logs_p.size() != expected_text ||
+                    task->style_bert_decoder_g.size() != style_runner->model->gin_channels) {
+                    task->message = std::format(
+                        "Style-Bert latent input size mismatch: tokens={}, logw={}, x_mask={}, m_p={} expected_m_p={}, logs_p={} expected_logs_p={}, g={} expected_g={}.",
+                        expected_tokens,
+                        task->style_bert_logw.size(),
+                        task->style_bert_x_mask.size(),
+                        task->style_bert_m_p.size(),
+                        expected_text,
+                        task->style_bert_logs_p.size(),
+                        expected_text,
+                        task->style_bert_decoder_g.size(),
+                        style_runner->model->gin_channels);
+                    response_map->push(task);
+                    break;
+                }
+
+                style_bert_vits2_alignment_result alignment =
+                    style_runner->expand_alignment(task->style_bert_logw.data(),
+                                                   task->style_bert_x_mask.data(),
+                                                   task->style_bert_m_p.data(),
+                                                   task->style_bert_logs_p.data(),
+                                                   task->style_bert_tokens,
+                                                   task->style_bert_length_scale);
+                const size_t expected_noise =
+                    (size_t) style_runner->model->inter_channels * alignment.frames;
+                if (task->style_bert_noise.size() != expected_noise) {
+                    task->message = std::format("Style-Bert latent noise size mismatch: got {}, expected {} for {} frames.",
+                                                task->style_bert_noise.size(),
+                                                expected_noise,
+                                                alignment.frames);
+                    response_map->push(task);
+                    break;
+                }
+
+                std::vector<float> decoder_z;
+                style_runner->build_decoder_latent(task->style_bert_logw.data(),
+                                                   task->style_bert_x_mask.data(),
+                                                   task->style_bert_m_p.data(),
+                                                   task->style_bert_logs_p.data(),
+                                                   task->style_bert_noise.data(),
+                                                   task->style_bert_decoder_g.data(),
+                                                   task->style_bert_tokens,
+                                                   task->style_bert_length_scale,
+                                                   task->style_bert_noise_scale,
+                                                   decoder_z);
+                data = new tts_response;
+                style_runner->decode(decoder_z.data(),
+                                     task->style_bert_decoder_g.data(),
+                                     alignment.frames,
+                                     *data);
+                task->response    = (void *) data->data;
+                task->length      = data->n_outputs;
+                task->sample_rate = style_runner->sampling_rate;
+                task->success     = data->n_outputs != 0;
+                response_map->push(task);
+                break;
+            }
+            case STYLE_BERT_VITS2_SYNTHESIZE_FRONT: {
+                auto * style_runner = dynamic_cast<style_bert_vits2_runner *>(&runner);
+                if (!style_runner) {
+                    task->message = "Selected model is not a Style-Bert-VITS2 GGML model.";
+                    response_map->push(task);
+                    break;
+                }
+                const size_t tokens = task->style_bert_tokens;
+                const size_t expected_bert = tokens * 1024;
+                if (tokens == 0 ||
+                    task->style_bert_phone_ids.size() != tokens ||
+                    task->style_bert_tone_ids.size() != tokens ||
+                    task->style_bert_language_ids.size() != tokens ||
+                    task->style_bert_bert.size() != expected_bert) {
+                    task->message = std::format(
+                        "Style-Bert front input size mismatch: tokens={}, phone_ids={}, tone_ids={}, language_ids={}, bert={} expected_bert={}.",
+                        tokens,
+                        task->style_bert_phone_ids.size(),
+                        task->style_bert_tone_ids.size(),
+                        task->style_bert_language_ids.size(),
+                        task->style_bert_bert.size(),
+                        expected_bert);
+                    response_map->push(task);
+                    break;
+                }
+
+                std::vector<float> g;
+                std::vector<float> style_vec;
+                std::vector<float> x_mask(tokens, 1.0f);
+                std::vector<float> x;
+                std::vector<float> m_p;
+                std::vector<float> logs_p;
+                std::vector<float> logw;
+                style_runner->encode_speaker(task->style_bert_speaker_id, g);
+                style_runner->encode_style_vector(task->style_bert_style_id, task->style_bert_style_weight, style_vec);
+                style_runner->run_text_encoder(task->style_bert_phone_ids.data(),
+                                               task->style_bert_tone_ids.data(),
+                                               task->style_bert_language_ids.data(),
+                                               task->style_bert_bert.data(),
+                                               style_vec.data(),
+                                               x_mask.data(),
+                                               g.data(),
+                                               (uint32_t) tokens,
+                                               x,
+                                               m_p,
+                                               logs_p);
+                std::vector<float> logw_dp;
+                style_runner->predict_duration(x.data(), x_mask.data(), g.data(), (uint32_t) tokens, logw_dp);
+                logw = logw_dp;
+                if (std::fabs(task->style_bert_sdp_ratio) > 1e-6f) {
+                    std::vector<float> sdp_condition;
+                    style_runner->run_stochastic_duration_condition(x.data(),
+                                                                    x_mask.data(),
+                                                                    g.data(),
+                                                                    (uint32_t) tokens,
+                                                                    sdp_condition);
+                    std::vector<float> sdp_noise((size_t) tokens * 2);
+                    random_normal_gen((int) sdp_noise.size(), sdp_noise.data());
+                    for (float & value : sdp_noise) {
+                        value *= task->style_bert_noise_w_scale;
+                    }
+                    std::vector<float> logw_sdp;
+                    style_runner->run_stochastic_duration_reverse(sdp_noise.data(),
+                                                                  x_mask.data(),
+                                                                  sdp_condition.data(),
+                                                                  (uint32_t) tokens,
+                                                                  logw_sdp);
+                    logw.resize(tokens);
+                    for (size_t i = 0; i < tokens; ++i) {
+                        logw[i] = logw_sdp[i] * task->style_bert_sdp_ratio +
+                                  logw_dp[i] * (1.0f - task->style_bert_sdp_ratio);
+                    }
+                }
+                style_bert_vits2_alignment_result alignment =
+                    style_runner->expand_alignment(logw.data(),
+                                                   x_mask.data(),
+                                                   m_p.data(),
+                                                   logs_p.data(),
+                                                   (uint32_t) tokens,
+                                                   task->style_bert_length_scale);
+                std::vector<float> noise((size_t) style_runner->model->inter_channels * alignment.frames);
+                random_normal_gen((int) noise.size(), noise.data());
+                std::vector<float> decoder_z;
+                style_runner->build_decoder_latent(logw.data(),
+                                                   x_mask.data(),
+                                                   m_p.data(),
+                                                   logs_p.data(),
+                                                   noise.data(),
+                                                   g.data(),
+                                                   (uint32_t) tokens,
+                                                   task->style_bert_length_scale,
+                                                   task->style_bert_noise_scale,
+                                                   decoder_z);
+                data = new tts_response;
+                style_runner->decode(decoder_z.data(),
+                                     g.data(),
+                                     alignment.frames,
+                                     *data);
+                task->response    = (void *) data->data;
+                task->length      = data->n_outputs;
+                task->sample_rate = style_runner->sampling_rate;
+                task->success     = data->n_outputs != 0;
+                response_map->push(task);
+                break;
+            }
         }
     }
 };
@@ -344,6 +617,125 @@ void complete(worker_pool * pool) {
 
 static std::string safe_json_to_str(json data) {
     return data.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
+static bool base64_decode_bytes(const std::string & input, std::vector<uint8_t> & output, std::string & error) {
+    static const std::array<int16_t, 256> table = [] {
+        std::array<int16_t, 256> values{};
+        values.fill(-1);
+        const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (size_t i = 0; i < alphabet.size(); ++i) {
+            values[(uint8_t) alphabet[i]] = (int16_t) i;
+        }
+        return values;
+    }();
+
+    output.clear();
+    output.reserve((input.size() * 3) / 4);
+    int value = 0;
+    int bits = -8;
+    bool padded = false;
+    for (const unsigned char c : input) {
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+            continue;
+        }
+        if (c == '=') {
+            padded = true;
+            continue;
+        }
+        if (padded) {
+            error = "base64 data contains non-padding characters after '='.";
+            return false;
+        }
+        const int decoded = table[c];
+        if (decoded < 0) {
+            error = "base64 data contains an invalid character.";
+            return false;
+        }
+        value = (value << 6) | decoded;
+        bits += 6;
+        if (bits >= 0) {
+            output.push_back((uint8_t) ((value >> bits) & 0xff));
+            bits -= 8;
+        }
+    }
+    return true;
+}
+
+template <typename T>
+static bool json_binary_array(const json & data, const std::string & key, std::vector<T> & output, std::string & error) {
+    const std::string binary_key = key + "_b64";
+    if (!data.contains(binary_key)) {
+        return false;
+    }
+    if (!data.at(binary_key).is_string()) {
+        error = std::format("the '{}' field must be a base64 string.", binary_key);
+        return true;
+    }
+    std::vector<uint8_t> bytes;
+    if (!base64_decode_bytes(data.at(binary_key).get<std::string>(), bytes, error)) {
+        error = std::format("the '{}' field is invalid: {}", binary_key, error);
+        return true;
+    }
+    if (bytes.empty()) {
+        error = std::format("the '{}' field must not be empty.", binary_key);
+        return true;
+    }
+    if (bytes.size() % sizeof(T) != 0) {
+        error = std::format("the '{}' decoded byte length must be a multiple of {}.", binary_key, sizeof(T));
+        return true;
+    }
+    output.resize(bytes.size() / sizeof(T));
+    std::memcpy(output.data(), bytes.data(), bytes.size());
+    return true;
+}
+
+static bool json_float_array(const json & data, const std::string & key, std::vector<float> & output, std::string & error) {
+    if (json_binary_array<float>(data, key, output, error)) {
+        return error.empty();
+    }
+    if (!data.contains(key) || !data.at(key).is_array()) {
+        error = std::format("the '{}' field is required and must be an array or provide '{}_b64'.", key, key);
+        return false;
+    }
+    output.clear();
+    output.reserve(data.at(key).size());
+    for (const auto & item : data.at(key)) {
+        if (!item.is_number()) {
+            error = std::format("the '{}' field must contain only numbers.", key);
+            return false;
+        }
+        output.push_back(item.get<float>());
+    }
+    if (output.empty()) {
+        error = std::format("the '{}' field must not be empty.", key);
+        return false;
+    }
+    return true;
+}
+
+static bool json_int_array(const json & data, const std::string & key, std::vector<int32_t> & output, std::string & error) {
+    if (json_binary_array<int32_t>(data, key, output, error)) {
+        return error.empty();
+    }
+    if (!data.contains(key) || !data.at(key).is_array()) {
+        error = std::format("the '{}' field is required and must be an array or provide '{}_b64'.", key, key);
+        return false;
+    }
+    output.clear();
+    output.reserve(data.at(key).size());
+    for (const auto & item : data.at(key)) {
+        if (!item.is_number_integer()) {
+            error = std::format("the '{}' field must contain only integers.", key);
+            return false;
+        }
+        output.push_back(item.get<int32_t>());
+    }
+    if (output.empty()) {
+        error = std::format("the '{}' field must not be empty.", key);
+        return false;
+    }
+    return true;
 }
 
 // this function maybe used outside of server_task_result_error
@@ -624,7 +1016,10 @@ int main(int argc, const char ** argv) {
     };
 
     const auto handle_health = [&](const httplib::Request &, httplib::Response & res) {
-        json health = {{"status", "ok"}};
+        json health = {
+            {"status", "ok"},
+            {"style_bert_vits2", style_bert_vits2_runtime_config()},
+        };
         res_ok_json(res, health);
     };
 
@@ -684,6 +1079,10 @@ int main(int argc, const char ** argv) {
         if (data.contains("top_p") && data.at("top_p").is_number()) {
             top_p = data.at("top_p").get<float>();
             conf.top_p = top_p;
+        }
+
+        if (data.contains("max_tokens") && data.at("max_tokens").is_number_integer()) {
+            conf.max_tokens = data.at("max_tokens").get<int>();
         }
 
         if (data.contains("repetition_penalty") && data.at("repetition_penalty").is_number()) {
@@ -841,10 +1240,282 @@ int main(int argc, const char ** argv) {
         res_ok_json(res, voices_json);
     };
 
+    const auto handle_style_bert_vits2_decode = [
+        &tqueue,
+        &rmap,
+        &res_error,
+        &res_ok_audio,
+        &model_map,
+        &default_model
+    ](const httplib::Request & req, httplib::Response & res) {
+        json data = json::parse(req.body);
+
+        std::vector<float> decoder_z;
+        std::vector<float> decoder_g;
+        std::string error;
+        if (!json_float_array(data, "decoder_z", decoder_z, error) ||
+            !json_float_array(data, "decoder_g", decoder_g, error)) {
+            res_error(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (!data.contains("frames") || !data.at("frames").is_number_integer()) {
+            res_error(res, format_error_response("the 'frames' field is required and must be an integer.", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        const int frames = data.at("frames").get<int>();
+        if (frames <= 0) {
+            res_error(res, format_error_response("the 'frames' field must be greater than 0.", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        std::string mime_type = MIMETYPE_WAV;
+        AudioFileFormat audio_type = AudioFileFormat::Wave;
+        if (data.contains("response_format") && data.at("response_format").is_string()) {
+            std::string format = data.at("response_format").get<std::string>();
+            if (format != "wav" && format != "wave" && format != "aiff") {
+                res_error(res, format_error_response("Currently 'wav' and 'aiff' are the only supported formats for the 'response_format' field.", ERROR_TYPE_NOT_SUPPORTED));
+                return;
+            } else if (format == "aiff") {
+                mime_type = MIMETYPE_AIFF;
+                audio_type = AudioFileFormat::Aiff;
+            }
+        }
+
+        struct simple_server_task * task = new simple_server_task(STYLE_BERT_VITS2_DECODE);
+        int id = task->id;
+        if (data.contains("model") && data.at("model").is_string()) {
+            const std::string model = data.at("model");
+            if (!model_map.contains(model)) {
+                const std::string message = std::format("Invalid Model: {0}", model);
+                res_error(res, format_error_response(message, ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            task->model = model;
+        } else {
+            task->model = default_model;
+        }
+        task->style_bert_decoder_z = std::move(decoder_z);
+        task->style_bert_decoder_g = std::move(decoder_g);
+        task->style_bert_decoder_frames = (uint32_t) frames;
+
+        tqueue->push(task);
+        struct simple_server_task * rtask = rmap->get(id);
+        if (!rtask->success) {
+            res_error(res, format_error_response(rtask->message, ERROR_TYPE_SERVER));
+            return;
+        }
+
+        std::vector<uint8_t> audio;
+        bool success = write_audio_data((float *)rtask->response, rtask->length, audio, audio_type, rtask->sample_rate, 440.f, 1, true);
+        if (!success) {
+            res_error(res, format_error_response("failed to write audio data", ERROR_TYPE_SERVER));
+            return;
+        }
+        res_ok_audio(res, audio, mime_type);
+    };
+
+    const auto handle_style_bert_vits2_synthesize_latent = [
+        &tqueue,
+        &rmap,
+        &res_error,
+        &res_ok_audio,
+        &model_map,
+        &default_model
+    ](const httplib::Request & req, httplib::Response & res) {
+        json data = json::parse(req.body);
+
+        std::vector<float> logw;
+        std::vector<float> x_mask;
+        std::vector<float> m_p;
+        std::vector<float> logs_p;
+        std::vector<float> noise;
+        std::vector<float> g;
+        std::string error;
+        if (!json_float_array(data, "logw", logw, error) ||
+            !json_float_array(data, "x_mask", x_mask, error) ||
+            !json_float_array(data, "m_p", m_p, error) ||
+            !json_float_array(data, "logs_p", logs_p, error) ||
+            !json_float_array(data, "noise", noise, error)) {
+            res_error(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (data.contains("g")) {
+            if (!json_float_array(data, "g", g, error)) {
+                res_error(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+        } else if (!json_float_array(data, "decoder_g", g, error)) {
+            res_error(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        int tokens = (int) logw.size();
+        if (data.contains("tokens") && data.at("tokens").is_number_integer()) {
+            tokens = data.at("tokens").get<int>();
+        }
+        if (tokens <= 0) {
+            res_error(res, format_error_response("the 'tokens' field must be greater than 0.", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if ((size_t) tokens != logw.size() || (size_t) tokens != x_mask.size()) {
+            res_error(res, format_error_response("the 'tokens' field must match logw and x_mask lengths.", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        std::string mime_type = MIMETYPE_WAV;
+        AudioFileFormat audio_type = AudioFileFormat::Wave;
+        if (data.contains("response_format") && data.at("response_format").is_string()) {
+            std::string format = data.at("response_format").get<std::string>();
+            if (format != "wav" && format != "wave" && format != "aiff") {
+                res_error(res, format_error_response("Currently 'wav' and 'aiff' are the only supported formats for the 'response_format' field.", ERROR_TYPE_NOT_SUPPORTED));
+                return;
+            } else if (format == "aiff") {
+                mime_type = MIMETYPE_AIFF;
+                audio_type = AudioFileFormat::Aiff;
+            }
+        }
+
+        struct simple_server_task * task = new simple_server_task(STYLE_BERT_VITS2_SYNTHESIZE_LATENT);
+        int id = task->id;
+        if (data.contains("model") && data.at("model").is_string()) {
+            const std::string model = data.at("model");
+            if (!model_map.contains(model)) {
+                const std::string message = std::format("Invalid Model: {0}", model);
+                res_error(res, format_error_response(message, ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            task->model = model;
+        } else {
+            task->model = default_model;
+        }
+        task->style_bert_logw = std::move(logw);
+        task->style_bert_x_mask = std::move(x_mask);
+        task->style_bert_m_p = std::move(m_p);
+        task->style_bert_logs_p = std::move(logs_p);
+        task->style_bert_noise = std::move(noise);
+        task->style_bert_decoder_g = std::move(g);
+        task->style_bert_tokens = (uint32_t) tokens;
+        task->style_bert_length_scale = json_value(data, "length_scale", 1.0f);
+        task->style_bert_noise_scale = json_value(data, "noise_scale", 0.6f);
+
+        tqueue->push(task);
+        struct simple_server_task * rtask = rmap->get(id);
+        if (!rtask->success) {
+            res_error(res, format_error_response(rtask->message, ERROR_TYPE_SERVER));
+            return;
+        }
+
+        std::vector<uint8_t> audio;
+        bool success = write_audio_data((float *)rtask->response, rtask->length, audio, audio_type, rtask->sample_rate, 440.f, 1, true);
+        if (!success) {
+            res_error(res, format_error_response("failed to write audio data", ERROR_TYPE_SERVER));
+            return;
+        }
+        res_ok_audio(res, audio, mime_type);
+    };
+
+    const auto handle_style_bert_vits2_synthesize_front = [
+        &tqueue,
+        &rmap,
+        &res_error,
+        &res_ok_audio,
+        &model_map,
+        &default_model
+    ](const httplib::Request & req, httplib::Response & res) {
+        json data = json::parse(req.body);
+
+        std::vector<int32_t> phone_ids;
+        std::vector<int32_t> tone_ids;
+        std::vector<int32_t> language_ids;
+        std::vector<float> bert;
+        std::string error;
+        if (!json_int_array(data, "phone_ids", phone_ids, error) ||
+            !json_int_array(data, "tone_ids", tone_ids, error) ||
+            !json_int_array(data, "language_ids", language_ids, error) ||
+            !json_float_array(data, "bert", bert, error)) {
+            res_error(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (phone_ids.size() != tone_ids.size() || phone_ids.size() != language_ids.size()) {
+            res_error(res, format_error_response("phone_ids, tone_ids, and language_ids must have the same length.",
+                                                 ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (bert.size() != phone_ids.size() * 1024) {
+            res_error(res, format_error_response(std::format("bert must contain tokens*1024 floats: got {}, expected {}.",
+                                                             bert.size(),
+                                                             phone_ids.size() * 1024),
+                                                 ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        const float sdp_ratio = json_value(data, "sdp_ratio", 0.0f);
+
+        std::string mime_type = MIMETYPE_WAV;
+        AudioFileFormat audio_type = AudioFileFormat::Wave;
+        if (data.contains("response_format") && data.at("response_format").is_string()) {
+            std::string format = data.at("response_format").get<std::string>();
+            if (format != "wav" && format != "wave" && format != "aiff") {
+                res_error(res, format_error_response("Currently 'wav' and 'aiff' are the only supported formats for the 'response_format' field.", ERROR_TYPE_NOT_SUPPORTED));
+                return;
+            } else if (format == "aiff") {
+                mime_type = MIMETYPE_AIFF;
+                audio_type = AudioFileFormat::Aiff;
+            }
+        }
+
+        struct simple_server_task * task = new simple_server_task(STYLE_BERT_VITS2_SYNTHESIZE_FRONT);
+        int id = task->id;
+        if (data.contains("model") && data.at("model").is_string()) {
+            const std::string model = data.at("model");
+            if (!model_map.contains(model)) {
+                const std::string message = std::format("Invalid Model: {0}", model);
+                res_error(res, format_error_response(message, ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            task->model = model;
+        } else {
+            task->model = default_model;
+        }
+        task->style_bert_tokens = (uint32_t) phone_ids.size();
+        task->style_bert_phone_ids = std::move(phone_ids);
+        task->style_bert_tone_ids = std::move(tone_ids);
+        task->style_bert_language_ids = std::move(language_ids);
+        task->style_bert_bert = std::move(bert);
+        task->style_bert_speaker_id = json_value(data, "speaker_id", 0);
+        task->style_bert_style_id = json_value(data, "style_id", 0);
+        task->style_bert_style_weight = json_value(data, "style_weight", 1.0f);
+        task->style_bert_sdp_ratio = sdp_ratio;
+        task->style_bert_length_scale = json_value(data, "length_scale", 1.0f);
+        task->style_bert_noise_scale = json_value(data, "noise_scale", 0.6f);
+        task->style_bert_noise_w_scale = json_value(
+            data,
+            "sdp_noise_scale",
+            json_value(data, "noise_w_scale", json_value(data, "noise_w", 0.8f)));
+
+        tqueue->push(task);
+        struct simple_server_task * rtask = rmap->get(id);
+        if (!rtask->success) {
+            res_error(res, format_error_response(rtask->message, ERROR_TYPE_SERVER));
+            return;
+        }
+
+        std::vector<uint8_t> audio;
+        bool success = write_audio_data((float *)rtask->response, rtask->length, audio, audio_type, rtask->sample_rate, 440.f, 1, true);
+        if (!success) {
+            res_error(res, format_error_response("failed to write audio data", ERROR_TYPE_SERVER));
+            return;
+        }
+        res_ok_audio(res, audio, mime_type);
+    };
+
     // register API routes
     svr->Get("/", handle_index);
     svr->Get("/health", handle_health);
     svr->Post("/v1/audio/speech", handle_tts);
+    svr->Post("/v1/style-bert-vits2/decode", handle_style_bert_vits2_decode);
+    svr->Post("/v1/style-bert-vits2/synthesize-latent", handle_style_bert_vits2_synthesize_latent);
+    svr->Post("/v1/style-bert-vits2/synthesize-front", handle_style_bert_vits2_synthesize_front);
     svr->Post("/v1/audio/conditional-prompt", handle_conditional);
     svr->Get("/v1/models", handle_models);
     svr->Get("/v1/audio/voices", handle_voices);

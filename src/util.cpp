@@ -105,6 +105,7 @@ bool has_prefix(std::string value, std::string prefix) {
 }
 
 struct ggml_tensor * stft(ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * window, size_t n_fft, size_t hop, bool abs_and_angle, bool one_sided) {
+#if TTS_BUILD_KOKORO
     if (window->ne[0] != n_fft) {
         TTS_ABORT("For #stft the window_size, %d, must be either equal to n_fft, %d, or, when one sided, n_fft / 2 + 1, %d.\n", a->ne[0], n_fft, n_fft/2+1);
     }
@@ -114,15 +115,37 @@ struct ggml_tensor * stft(ggml_context * ctx, struct ggml_tensor * a, struct ggm
     }
 
     return cur;
+#else
+    (void) ctx;
+    (void) a;
+    (void) window;
+    (void) n_fft;
+    (void) hop;
+    (void) abs_and_angle;
+    (void) one_sided;
+    TTS_ABORT("stft requires the legacy TTS.cpp ggml custom op port; configure with TTS_BUILD_KOKORO=ON and the support-for-tts ggml fork.\n");
+#endif
 }
 
 struct ggml_tensor * istft(ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * window_squared_sum, struct ggml_tensor * window, size_t n_fft, size_t hop, bool abs_and_angle, bool one_sided) {
+#if TTS_BUILD_KOKORO
     if ((!one_sided && a->ne[0] != n_fft) || (one_sided && a->ne[0] != n_fft / 2 + 1)) {
         TTS_ABORT("For #istft the window_size, %d, must be either equal to n_fft, %d, or, when one sided, n_fft / 2 + 1, %d.\n", a->ne[0], n_fft, n_fft/2+1);
     }
     struct ggml_tensor * cur = ggml_istft(ctx, a, window, n_fft, hop, abs_and_angle);
     cur = ggml_div(ctx, cur, window_squared_sum);
     return cur;
+#else
+    (void) ctx;
+    (void) a;
+    (void) window_squared_sum;
+    (void) window;
+    (void) n_fft;
+    (void) hop;
+    (void) abs_and_angle;
+    (void) one_sided;
+    TTS_ABORT("istft requires the legacy TTS.cpp ggml custom op port; configure with TTS_BUILD_KOKORO=ON and the support-for-tts ggml fork.\n");
+#endif
 }
 
 void hann_window(size_t n_fft, std::vector<float> & tgt) {

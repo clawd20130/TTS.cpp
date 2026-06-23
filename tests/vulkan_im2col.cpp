@@ -140,6 +140,15 @@ int main() {
             2, 1,
         },
         {
+            "im2col_1d_style_bert_conv_pre",
+            false,
+            60, 1, 192, 1,
+            7, 1, 512,
+            1, 1,
+            3, 0,
+            1, 1,
+        },
+        {
             "im2col_2d_padded",
             true,
             9, 7, 3, 2,

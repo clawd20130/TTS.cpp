@@ -1,0 +1,157 @@
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -6064,6 +6064,7 @@
+     ggml_barrier(params->threadpool);
+
+     const int32_t s0 = ((const int32_t*)(dst->op_params))[0];
++    const int32_t p0 = ((const int32_t*)(dst->op_params))[1];
+
+     // total rows in dst
+     const int nr = ne1;
+@@ -6084,11 +6085,15 @@
+         for (int i10 = 0; i10 < ne10; i10++) {
+             const int i1n = i10*ne11;
+             for (int i00 = 0; i00 < ne00; i00++) {
++                const int out_idx = i10*s0 + i00 - p0;
++                if (out_idx < 0 || out_idx >= ne0) {
++                    continue;
++                }
+                 float v = 0;
+                 ggml_vec_dot_f16(ne02, &v, 0,
+                         (ggml_fp16_t *)    wdata_src + i1n, 0,
+                         (ggml_fp16_t *) wdata_kernel + i00*ne02, 0, 1);
+-                dst_data[i10*s0 + i00] += v;
++                dst_data[out_idx] += v;
+             }
+         }
+     }
+@@ -6152,6 +6157,7 @@
+     ggml_barrier(params->threadpool);
+
+     const int32_t s0 = ((const int32_t*)(dst->op_params))[0];
++    const int32_t p0 = ((const int32_t*)(dst->op_params))[1];
+
+     // total rows in dst
+     const int nr = ne1;
+@@ -6172,11 +6178,15 @@
+         for (int i10 = 0; i10 < ne10; i10++) {
+             const int i1n = i10*ne11;
+             for (int i00 = 0; i00 < ne00; i00++) {
++                const int out_idx = i10*s0 + i00 - p0;
++                if (out_idx < 0 || out_idx >= ne0) {
++                    continue;
++                }
+                 float v = 0;
+                 ggml_vec_dot_f32(ne02, &v, 0,
+                         wdata_src + i1n, 0,
+                         wdata_kernel + i00*ne02, 0, 1);
+-                dst_data[i10*s0 + i00] += v;
++                dst_data[out_idx] += v;
+             }
+         }
+     }
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1578,6 +1578,7 @@
+     uint32_t nb1;
+
+     int32_t s0;
++    int32_t p0;
+ };
+
+ struct vk_op_snake_push_constants {
+@@ -12969,6 +12970,7 @@
+     GGML_ASSERT(nb10 == sizeof(float));
+
+     const int32_t s0 = dst->op_params[0];
++    const int32_t p0 = dst->op_params[1];
+
+     vk_op_conv_transpose_1d_push_constants p{};
+     p.Cout = static_cast<uint32_t>(ne01);
+@@ -12981,6 +12983,7 @@
+     p.nb11 = static_cast<uint32_t>(nb11 / nb10);
+     p.nb1 = static_cast<uint32_t>(nb1 / nb0);
+     p.s0 = static_cast<uint32_t>(s0);
++    p.p0 = p0;
+
+     ggml_vk_op_f32(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_CONV_TRANSPOSE_1D, std::move(p));
+ }
+--- a/src/ggml-vulkan/vulkan-shaders/conv_transpose_1d.comp
++++ b/src/ggml-vulkan/vulkan-shaders/conv_transpose_1d.comp
+@@ -21,6 +21,7 @@
+     uint32_t nb1;
+
+     int32_t s0;
++    int32_t p0;
+ } p;
+
+
+@@ -80,9 +81,9 @@
+         if(L_block_id < L_blocks-1){
+             for(uint32_t s0_idx = 0; s0_idx < p.s0; s0_idx++){
+                 uint32_t sh_idx = p.s0*tid+s0_idx;
+-                uint32_t KL_idx = KLb_idx+sh_idx;
+-                if(KL_idx < p.KL){
+-                    data_d[KL_idx + Cout_idx*p.nb1] = tmp[sh_idx];
++                int32_t KL_idx = int32_t(KLb_idx+sh_idx) - p.p0;
++                if(KL_idx >= 0 && KL_idx < int32_t(p.KL)){
++                    data_d[uint32_t(KL_idx) + Cout_idx*p.nb1] = tmp[sh_idx];
+                 }
+             }
+         }
+@@ -90,9 +91,9 @@
+
+     for(uint32_t i = 0; i < splitWork(tmp_len); i++){
+         uint32_t idx = i*bs+tid;
+-        uint32_t KL_idx = (L_blocks-1)*bs*p.s0+idx;
+-        if(KL_idx < p.KL){
+-            data_d[KL_idx + Cout_idx*p.nb1] = tmp[idx];
++        int32_t KL_idx = int32_t((L_blocks-1)*bs*p.s0+idx) - p.p0;
++        if(KL_idx >= 0 && KL_idx < int32_t(p.KL)){
++            data_d[uint32_t(KL_idx) + Cout_idx*p.nb1] = tmp[idx];
+         }
+     }
+ }
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -4489,7 +4489,11 @@
+         int                   s0,
+         int                   p0,
+         int                   d0) {
+-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, GGML_TYPE_F16); // [N, OL, IC * K]
++    enum ggml_type t = b->type;
++    if (a->type == GGML_TYPE_F16 || b->type == GGML_TYPE_F16) {
++        t = GGML_TYPE_F16;
++    }
++    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, t); // [N, OL, IC * K]
+
+     struct ggml_tensor * result =
+         ggml_mul_mat(ctx,
+@@ -4522,8 +4526,12 @@
+         int                   p0,
+         int                   d0) {
+     struct ggml_tensor * new_b = ggml_reshape_4d(ctx, b, b->ne[0], 1, b->ne[1], b->ne[2]);
+-
+-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, GGML_TYPE_F16);
++    enum ggml_type t = b->type;
++    if (a->type == GGML_TYPE_F16 || b->type == GGML_TYPE_F16) {
++        t = GGML_TYPE_F16;
++    }
++
++    struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, t);
+
+     struct ggml_tensor * result = ggml_mul_mat(ctx, im2col, a);
+
+@@ -4595,11 +4603,10 @@
+     GGML_ASSERT(a->ne[2] == b->ne[1]);
+     GGML_ASSERT(a->ne[3] == 1);
+
+-    GGML_ASSERT(p0 == 0);
+     GGML_ASSERT(d0 == 1);
+
+     const int64_t ne[4] = {
+-        ggml_calc_conv_transpose_1d_output_size(b->ne[0], a->ne[0], s0, 0 /*p0*/, 1 /*d0*/),
++        ggml_calc_conv_transpose_1d_output_size(b->ne[0], a->ne[0], s0, p0, 1 /*d0*/),
+         a->ne[1], b->ne[2], 1,
+     };
+     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);

@@ -1,5 +1,5 @@
 from .tts_encoder import TTSEncoder
-from .tensor_util import get_regularized_weight
+from .tensor_util import get_normalized_weight_from_parametrizations, get_regularized_weight
 
 # DAC_RESIDUAL_UNIT_PARTS, DAC_DECODER_PARTS, DAC_DECODER_BLOCK_PARTS are static mappings
 # of the pytorch DAC Model parameter names to easily interpretable TTS.cpp names (saved to the
@@ -26,9 +26,11 @@ DAC_DECODER_PARTS = {
 }
 
 DAC_DECODER_BLOCK_PARTS = {
-    "block.2": "residual_unit.0",
-    "block.3": "residual_unit.1",
-    "block.4": "residual_unit.2",
+    # Keep generated GGUF tensor names below upstream ggml's GGML_MAX_NAME=64.
+    # The runtime parses the numeric unit index and does not depend on this label text.
+    "block.2": "ru.0",
+    "block.3": "ru.1",
+    "block.4": "ru.2",
     "block.0.alpha": "final.alpha",
     "block.1.bias": "final.bias",
     "block.1.weight": "final.weight",
@@ -54,6 +56,12 @@ class DACEncoder(TTSEncoder):
                 name = ".".join(name_parts)
             elif name_parts[-1] == "weight_v":
                 # ignore because we will encode the weight when we see the weight_g param
+                continue
+            elif name.endswith(".parametrizations.weight.original0"):
+                param = get_normalized_weight_from_parametrizations(modules, name)
+                name = name.replace(".parametrizations.weight.original0", ".weight")
+            elif name.endswith(".parametrizations.weight.original1"):
+                # ignore because we will encode the weight when we see the original0 param
                 continue
             parts = name.split(".block")
             new_name = ["audio_encoder"]
@@ -92,6 +100,12 @@ class DACEncoder(TTSEncoder):
                 name = ".".join(name_parts)
             elif name_parts[-1] == "weight_v":
                 # ignore because we will encode the weight when we see the weight_g param
+                continue
+            elif name.endswith(".parametrizations.weight.original0"):
+                param = get_normalized_weight_from_parametrizations(modules, name)
+                name = name.replace(".parametrizations.weight.original0", ".weight")
+            elif name.endswith(".parametrizations.weight.original1"):
+                # ignore because we will encode the weight when we see the original0 param
                 continue
             new_name = f"audio_encoder.{name}"
             self.set_tensor(new_name, param)

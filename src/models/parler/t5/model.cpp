@@ -376,8 +376,10 @@ struct t5_runner * text_encoder_from_file(std::string file_path, int n_threads, 
     if (!meta_ctx) {
         TTS_ABORT("%s failed for file %s\n", __func__, file_path.c_str());
     }
+    bool owns_tokenizer = false;
     if (!tokenizer) {
         tokenizer = unigram_tokenizer_from_gguf(meta_ctx);
+        owns_tokenizer = true;
     }
     if (!tokenizer->init) {
         tokenizer->initialize_tokenizer();
@@ -390,7 +392,7 @@ struct t5_runner * text_encoder_from_file(std::string file_path, int n_threads, 
     }
 
     struct t5_context * t5ctx = build_new_t5_context(model, n_threads, cpu_only);
-    struct t5_runner * runner = new t5_runner(model, t5ctx, tokenizer);
+    struct t5_runner * runner = new t5_runner(model, t5ctx, tokenizer, owns_tokenizer);
     runner->prepare_post_load();
     gguf_free(meta_ctx);
     ggml_free(weight_ctx);

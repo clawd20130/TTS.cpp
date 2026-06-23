@@ -1,5 +1,29 @@
 #include "model.h"
 
+#include <cstdlib>
+#include <cstring>
+
+static constexpr uint32_t PARLER_MIN_DECODABLE_AUDIO_TOKENS = 12;
+
+static bool parler_debug_tokens_enabled() {
+    const char * env = std::getenv("PARLER_DEBUG_TOKENS");
+    return env && env[0] && std::strcmp(env, "0") != 0;
+}
+
+static void parler_debug_print_tokens(const char * label, const std::vector<uint32_t> & tokens, uint32_t n_heads) {
+    if (!parler_debug_tokens_enabled()) {
+        return;
+    }
+    fprintf(stderr, "PARLER_DEBUG_%s count=%zu heads=%u tokens=", label, tokens.size(), n_heads);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (i > 0) {
+            fputc(',', stderr);
+        }
+        fprintf(stderr, "%u", tokens[i]);
+    }
+    fputc('\n', stderr);
+}
+
 // For loading parler model from gguf file.
 static const std::map<std::string, parler_tensor> PARLER_TENSOR_GGUF_LOOKUP = {
     {"layer_norm.weight", PARLER_NORM},
@@ -122,7 +146,7 @@ void parler_tts_model::prep_cross_key_values(int n_threads, struct tts_response 
         bufs = {backend_cpu_buffer};
         backs = {backend_cpu};
     }
-    ggml_backend_sched_t sched = ggml_backend_sched_new(backs.data(), bufs.data(), backs.size(), max_cross_nodes*n_layers, false, false);
+    ggml_backend_sched_t sched = tts_backend_sched_new(backs.data(), bufs.data(), backs.size(), max_cross_nodes*n_layers, false, true);
     
     std::vector<uint8_t> buf_compute_meta;
     buf_compute_meta.resize(max_cross_nodes*n_layers*ggml_tensor_overhead() + ggml_graph_overhead_custom(max_cross_nodes*n_layers, false));
@@ -325,6 +349,7 @@ void parler_context::reset(int32_t n_output_heads) {
     n_outputs = 0;
     prompt_end_position = 0;
     current_position = 0;
+    first_codebook_unfinished = 0;
     output_size = 0;
     output_tokens.clear();
     eos_seen.clear();
@@ -401,12 +426,21 @@ struct ggml_tensor * parler_build_inp_embd(struct ggml_context * ctx, struct par
         ggml_set_input(pctx->audio_inp_tokens);
         pctx->set_tensor_backend(pctx->audio_inp_tokens);
         struct ggml_tensor * audio_tokens = ggml_reshape_2d(ctx, pctx->audio_inp_tokens, batch.n_audio_tokens / model->n_output_heads, model->n_output_heads);
+        struct ggml_tensor * audio_embs = nullptr;
         for (int i = 0; i < model->n_output_heads; i++) {
             if (i == 0) {
-                input_embs = ggml_get_rows(ctx, model->embds[i], ggml_view_2d(ctx, audio_tokens, 1, batch.n_audio_tokens / model->n_output_heads, audio_tokens->nb[1], i*sizeof(int32_t)));
+                audio_embs = ggml_get_rows(ctx, model->embds[i], ggml_view_2d(ctx, audio_tokens, 1, batch.n_audio_tokens / model->n_output_heads, audio_tokens->nb[1], i*sizeof(int32_t)));
             } else {
-                input_embs = ggml_add(ctx, ggml_get_rows(ctx, model->embds[i], ggml_view_2d(ctx, audio_tokens, 1, batch.n_audio_tokens / model->n_output_heads, audio_tokens->nb[1], i*sizeof(int32_t))), input_embs);
+                audio_embs = ggml_add(ctx, ggml_get_rows(ctx, model->embds[i], ggml_view_2d(ctx, audio_tokens, 1, batch.n_audio_tokens / model->n_output_heads, audio_tokens->nb[1], i*sizeof(int32_t))), audio_embs);
             }
+        }
+        input_embs = audio_embs;
+        if (batch.n_tokens > 0) {
+            pctx->inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.n_tokens);
+            ggml_set_input(pctx->inp_tokens);
+            pctx->set_tensor_backend(pctx->inp_tokens);
+            struct ggml_tensor * prompt_embs = ggml_get_rows(ctx, model->prompt_embd, pctx->inp_tokens);
+            input_embs = ggml_concat(ctx, prompt_embs, audio_embs, 1);
         }
     } else {
         pctx->inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.n_tokens);
@@ -480,16 +514,29 @@ struct ggml_tensor * build_attn_mask_cross(ggml_context * ctx, parler_context * 
     return pctx->attn_mask_cross;
 }
 
-static struct parler_ubatch batch_from_sentence(std::string sentence, parler_tts_model * model, unigram_tokenizer * tokenizer) {
+static struct parler_ubatch batch_from_sentence(std::string sentence, parler_tts_model * model, unigram_tokenizer * tokenizer, bool include_audio_start = false) {
     struct parler_ubatch batch;
-    batch.audio_generation = false;
+    batch.audio_generation = include_audio_start;
     std::vector<uint32_t>* token_ids = new std::vector<uint32_t>;
     tokenizer->tokenize(sentence, *token_ids);
     token_ids->push_back(tokenizer->eos_token);
-    batch.current_step = 0;
+    parler_debug_print_tokens("TEXT_TOKENS", *token_ids, 0);
+    batch.current_step = include_audio_start ? 1 : 0;
     batch.n_tokens = token_ids->size();
-    batch.n_audio_tokens = 0;
-    batch.sequence_length = batch.n_tokens; // sequence_length is equal to the number of tokens for non-audio generation
+    std::vector<uint32_t>* audio_token_ids = nullptr;
+    if (include_audio_start) {
+        audio_token_ids = new std::vector<uint32_t>;
+        audio_token_ids->reserve(model->n_output_heads);
+        for (uint32_t i = 0; i < model->n_output_heads; ++i) {
+            audio_token_ids->push_back(model->bos_token_id);
+        }
+        batch.n_audio_tokens = audio_token_ids->size();
+        batch.audio_tokens = audio_token_ids->data();
+    } else {
+        batch.n_audio_tokens = 0;
+        batch.audio_tokens = nullptr;
+    }
+    batch.sequence_length = batch.n_tokens + (batch.n_audio_tokens / model->n_output_heads);
     std::vector<uint32_t>* position = new std::vector<uint32_t>;
     for (uint32_t i = 0; i < batch.sequence_length; i++) {
         position->push_back(i);
@@ -520,7 +567,7 @@ void parler_tts_runner::assign_weight(const char * name, ggml_tensor & tensor) {
 void parler_tts_runner::update_conditional_prompt(const char * file_path, const char * prompt) {
     const int      n_threads{ pctx->n_threads };
     const bool     cpu_only{ pctx->backend == nullptr };
-    t5_runner * text_encoder = text_encoder_from_file(file_path, n_threads, tokenizer, cpu_only);
+    t5_runner * text_encoder = text_encoder_from_file(file_path, n_threads, nullptr, cpu_only);
     tts_response response;
     text_encoder->generate(prompt, &response);
     model->prep_cross_key_values(n_threads, &response);
@@ -609,7 +656,11 @@ struct ggml_cgraph * parler_tts_runner::build_parler_graph(parler_ubatch & batch
 
         cur = parler_build_layer_norm(ctx, cur, model->layers[l]->final_norm, model->layers[l]->final_norm_bias);
         cur = ggml_mul_mat(ctx, model->layers[l]->fc1, cur);
+#if TTS_GGML_HAS_GELU_ERF
+        cur = ggml_gelu_erf(ctx, cur);
+#else
         cur = ggml_gelu(ctx, cur);
+#endif
         cur = ggml_mul_mat(ctx, model->layers[l]->fc2, cur);
         cur = ggml_add(ctx, cur, residualffn);
         inpL = cur;
@@ -625,6 +676,9 @@ struct ggml_cgraph * parler_tts_runner::build_parler_graph(parler_ubatch & batch
 
 void parler_tts_runner::set_inputs(parler_ubatch & batch) {
     if (batch.audio_generation) {
+        if (batch.n_tokens > 0) {
+            ggml_backend_tensor_set(pctx->inp_tokens, batch.tokens, 0, batch.n_tokens*ggml_element_size(pctx->inp_tokens));
+        }
         ggml_backend_tensor_set(pctx->audio_inp_tokens, batch.audio_tokens, 0, batch.n_audio_tokens*ggml_element_size(pctx->audio_inp_tokens));
     } else {
         ggml_backend_tensor_set(pctx->inp_tokens, batch.tokens, 0, batch.n_tokens*ggml_element_size(pctx->inp_tokens));
@@ -653,9 +707,13 @@ void parler_tts_runner::parler_graph_compute(ggml_cgraph * gf) {
 int parler_tts_runner::decode(parler_ubatch & batch) {
     ggml_backend_sched_reset(pctx->sched);
     
-    pctx->output_tokens.reserve(model->max_generation_size);
-    
-    const size_t logits_size = model->output_vocab_size*model->max_generation_size*model->n_output_heads;
+    pctx->output_tokens.reserve((size_t) model->max_generation_size * model->n_output_heads);
+
+    const size_t active_positions = (size_t) pctx->current_position + batch.sequence_length;
+    const size_t reserved_positions = (batch.audio_generation ? (size_t) pctx->prompt_end_position : batch.sequence_length) +
+                                      (size_t) model->max_generation_size;
+    const size_t logits_positions = std::max(active_positions, reserved_positions);
+    const size_t logits_size = (size_t) model->output_vocab_size * logits_positions * model->n_output_heads;
     const size_t prev_size = pctx->buf_output ? ggml_backend_buffer_get_size(pctx->buf_output) : 0;
     const size_t new_size  = logits_size * sizeof(float);
     
@@ -685,7 +743,20 @@ int parler_tts_runner::decode(parler_ubatch & batch) {
     parler_graph_compute(gf);
 
     float * logits_out = pctx->logits + pctx->n_outputs * model->output_vocab_size * model->n_output_heads;
-    pctx->get_ggml_node_data(res, logits_out, n_outputs_new*model->output_vocab_size*model->n_output_heads*sizeof(float));
+    const size_t logits_count = n_outputs_new * model->output_vocab_size * model->n_output_heads;
+    if (n_outputs_new == 1) {
+        pctx->get_ggml_node_data(res, logits_out, logits_count * sizeof(float));
+    } else {
+        std::vector<float> logits_tmp(logits_count);
+        pctx->get_ggml_node_data(res, logits_tmp.data(), logits_count * sizeof(float));
+        for (size_t pos = 0; pos < n_outputs_new; ++pos) {
+            for (uint32_t head = 0; head < model->n_output_heads; ++head) {
+                const float * src = logits_tmp.data() + ((size_t) head * n_outputs_new + pos) * model->output_vocab_size;
+                float * dst = logits_out + (pos * model->n_output_heads + head) * model->output_vocab_size;
+                memcpy(dst, src, model->output_vocab_size * sizeof(float));
+            }
+        }
+    }
 
     // set to total number of outputs in the batch*/
     pctx->n_outputs += n_outputs_new;
@@ -718,14 +789,16 @@ void parler_tts_runner::prepare_post_load() {
 }
 
 bool parler_tts_runner::check_stopping() {
+    if (model->max_generation_size > 0 &&
+        pctx->output_tokens.size() / model->n_output_heads >= model->max_generation_size) {
+        return true;
+    }
+
     int32_t token_position = (int32_t) pctx->output_tokens.size() - (int32_t) model->n_output_heads;
     if (token_position < 0) {
         return false;
     }
-    if (pctx->current_position >= model->max_generation_size) {
-        return true;
-    }
-        
+
     bool channels_complete = true;
     for (int i = 0; i < model->n_output_heads; i++) {
         pctx->eos_seen[i] = pctx->eos_seen[i] || pctx->output_tokens[token_position+i] == model->eos_token_id;
@@ -734,6 +807,38 @@ bool parler_tts_runner::check_stopping() {
         }
     }
     return channels_complete;
+}
+
+static void parler_apply_logits_processor(parler_tts_model * model, parler_context * pctx, parler_ubatch & batch, float * logits) {
+    if (batch.audio_generation && batch.n_audio_tokens > 0 && pctx->first_codebook_unfinished + 1 < model->n_output_heads) {
+        const uint32_t frame_count = batch.n_audio_tokens / model->n_output_heads;
+        for (uint32_t frame = 0; frame < frame_count; ++frame) {
+            const uint32_t token = batch.audio_tokens[frame * model->n_output_heads + pctx->first_codebook_unfinished];
+            if (token == model->eos_token_id) {
+                ++pctx->first_codebook_unfinished;
+            }
+        }
+    }
+
+    for (uint32_t head = pctx->first_codebook_unfinished + 1; head < model->n_output_heads; ++head) {
+        logits[(size_t) head * model->output_vocab_size + model->eos_token_id] = -INFINITY;
+    }
+}
+
+static uint32_t parler_next_decoder_input_token(parler_tts_model * model, uint32_t next_step, uint32_t head, const uint32_t * last_outputs) {
+    if (next_step <= head + 1) {
+        return model->bos_token_id;
+    }
+
+    // Match HF Parler's delayed-pattern tail: near max_length, later decoder inputs are forced to pad/eos per codebook.
+    const uint32_t eos_tail_step = model->max_generation_size > model->n_output_heads
+        ? model->max_generation_size - model->n_output_heads + 2 + head
+        : head + 1;
+    if (next_step > eos_tail_step) {
+        return model->eos_token_id;
+    }
+
+    return last_outputs[head];
 }
 
 void parler_tts_runner::adjust_output_tokens(std::vector<uint32_t> & output_tokens, std::vector<uint32_t> & filtered) {
@@ -775,29 +880,37 @@ int parler_tts_runner::generate_from_batch(parler_ubatch & batch, tts_response &
         }
         if (!batch.audio_generation) {
             pctx->prompt_end_position += batch.sequence_length;
+        } else if (batch.n_tokens > 0) {
+            pctx->prompt_end_position += batch.n_tokens;
         }
         if (batch.audio_generation) {
-            sampler->sample(pctx->logits + pctx->current_position * model->n_output_heads * model->output_vocab_size, pctx->output_tokens);
+            const size_t sample_position = (size_t) pctx->current_position + batch.sequence_length - 1;
+            float * logits = pctx->logits + sample_position * model->n_output_heads * model->output_vocab_size;
+            parler_apply_logits_processor(model, pctx, batch, logits);
+            sampler->sample(logits, pctx->output_tokens);
         }
         pctx->current_position += batch.sequence_length;
         next_decoder_token_ids.clear();
         uint32_t * last_outputs = (pctx->output_tokens.data() + (int) pctx->output_tokens.size() - model->n_output_heads);
+        const uint32_t next_step = (uint32_t) batch.current_step + 1;
         for (int i = 0; i < model->n_output_heads; i++) {
-            next_decoder_token_ids.push_back(batch.current_step > i ? pctx->eos_seen[i] ? model->eos_token_id : last_outputs[i] : model->bos_token_id);
+            next_decoder_token_ids.push_back(parler_next_decoder_input_token(model, next_step, (uint32_t) i, last_outputs));
         }
         batch = parler_ubatch{
-            true, 0, 9, 1, nullptr, next_decoder_token_ids.data(), &pctx->current_position, nullptr, batch.current_step+1
+            true, 0, model->n_output_heads, 1, nullptr, next_decoder_token_ids.data(), &pctx->current_position, nullptr, batch.current_step+1
         };
     }
 
     std::vector<uint32_t> filtered_output_tokens;
     adjust_output_tokens(pctx->output_tokens, filtered_output_tokens);
+    parler_debug_print_tokens("RAW_TOKENS", pctx->output_tokens, model->n_output_heads);
+    parler_debug_print_tokens("FILTERED_TOKENS", filtered_output_tokens, model->n_output_heads);
     dac_runner->run(filtered_output_tokens.data(), (int32_t) filtered_output_tokens.size() / model->n_output_heads, &output);
     return 0;
 }
 
 int parler_tts_runner::generate_audio_tokens(std::string sentence) {
-    parler_ubatch batch = batch_from_sentence(sentence, model, tokenizer);
+    parler_ubatch batch = batch_from_sentence(sentence, model, tokenizer, true);
     pctx->reset(model->n_output_heads);
     sampler->reset();
     int32_t seq_id = std::mt19937(std::random_device{}())();
@@ -818,18 +931,24 @@ int parler_tts_runner::generate_audio_tokens(std::string sentence) {
         }
         if (!batch.audio_generation) {
             pctx->prompt_end_position += batch.sequence_length;
+        } else if (batch.n_tokens > 0) {
+            pctx->prompt_end_position += batch.n_tokens;
         }
         if (batch.audio_generation) {
-            sampler->sample(pctx->logits + pctx->current_position * model->n_output_heads * model->output_vocab_size, pctx->output_tokens);
+            const size_t sample_position = (size_t) pctx->current_position + batch.sequence_length - 1;
+            float * logits = pctx->logits + sample_position * model->n_output_heads * model->output_vocab_size;
+            parler_apply_logits_processor(model, pctx, batch, logits);
+            sampler->sample(logits, pctx->output_tokens);
         }
         pctx->current_position += batch.sequence_length;
         next_decoder_token_ids.clear();
         uint32_t * last_outputs = (pctx->output_tokens.data() + (int) pctx->output_tokens.size() - model->n_output_heads);
+        const uint32_t next_step = (uint32_t) batch.current_step + 1;
         for (int i = 0; i < model->n_output_heads; i++) {
-            next_decoder_token_ids.push_back(batch.current_step > i ? pctx->eos_seen[i] ? model->eos_token_id : last_outputs[i] : model->bos_token_id);
+            next_decoder_token_ids.push_back(parler_next_decoder_input_token(model, next_step, (uint32_t) i, last_outputs));
         }
         batch = parler_ubatch{
-            true, 0, 9, 1, nullptr, next_decoder_token_ids.data(), &pctx->current_position, nullptr, batch.current_step+1
+            true, 0, model->n_output_heads, 1, nullptr, next_decoder_token_ids.data(), &pctx->current_position, nullptr, batch.current_step+1
         };
     }
 
@@ -850,10 +969,19 @@ void parler_tts_runner::generate(const char * sentence, tts_response & output,
     sampler->top_p              = config.top_p;
     model->use_cross_attn       = config.use_cross_attn;
     if (config.max_tokens > 0) {
-        model->max_generation_size = config.max_tokens;
+        if ((uint32_t) config.max_tokens < PARLER_MIN_DECODABLE_AUDIO_TOKENS) {
+            fprintf(stderr,
+                    "Warning: Parler max_tokens=%d is below the DAC minimum of %u; using %u.\n",
+                    config.max_tokens,
+                    PARLER_MIN_DECODABLE_AUDIO_TOKENS,
+                    PARLER_MIN_DECODABLE_AUDIO_TOKENS);
+            model->max_generation_size = PARLER_MIN_DECODABLE_AUDIO_TOKENS;
+        } else {
+            model->max_generation_size = config.max_tokens;
+        }
     }
 
-    parler_ubatch batch = batch_from_sentence(sentence, model, tokenizer);
+    parler_ubatch batch = batch_from_sentence(sentence, model, tokenizer, true);
     pctx->reset(model->n_output_heads);
     sampler->reset();
     pctx->current_position = 0;

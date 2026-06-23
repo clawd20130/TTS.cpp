@@ -39,7 +39,7 @@ class T5Encoder(TTSEncoder):
         # Configure GGUF Writer
         self.repo_id = repo_id
         self._model = None
-        self._tokenizer = None
+        self._description_tokenizer = None
 
     @property
     def model(self):
@@ -55,15 +55,19 @@ class T5Encoder(TTSEncoder):
 
     @property
     def tokenizer(self):
-        if self._tokenizer is None:
+        if self._description_tokenizer is None:
             try:
-                self._tokenizer = AutoTokenizer.from_pretrained(self.repo_id)
-            except Exception as e:
-                self.logger.exception(
-                    f"Failed with exception, {e}, when attempting to obtain obtain tokenizer at path or repo: '{self.repo_id}'"
-                )
-                raise e
-        return self._tokenizer
+                self._description_tokenizer = AutoTokenizer.from_pretrained(self.repo_id, subfolder="description_tokenizer")
+            except Exception as subfolder_error:
+                try:
+                    self._description_tokenizer = AutoTokenizer.from_pretrained(self.repo_id)
+                except Exception as root_error:
+                    self.logger.exception(
+                        "Failed to load description tokenizer from '%s' subfolder or root tokenizer.",
+                        self.repo_id,
+                    )
+                    raise root_error from subfolder_error
+        return self._description_tokenizer
 
     def prepare_tensors(self):
         """

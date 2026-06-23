@@ -98,7 +98,8 @@ static struct ggml_tensor * build_t5_attn_mask(ggml_context * ctx, struct t5_con
 
 // This struct is intended to manage the t5 encoder model's graph compilation and compute function.
 struct t5_runner : tts_runner {
-    t5_runner(t5_encoder * model, t5_context * context, unigram_tokenizer * tokenizer): model(model), t5ctx(context), tokenizer(tokenizer) {};
+    t5_runner(t5_encoder * model, t5_context * context, unigram_tokenizer * tokenizer, bool owns_tokenizer = false):
+        tokenizer(tokenizer), owns_tokenizer(owns_tokenizer), model(model), t5ctx(context) {};
     ~t5_runner() {
         if (ctx) {
             ggml_free(ctx);
@@ -106,8 +107,12 @@ struct t5_runner : tts_runner {
         model->free();
         delete model;
         delete t5ctx;
+        if (owns_tokenizer) {
+            delete tokenizer;
+        }
     }
     struct unigram_tokenizer * tokenizer;
+    bool owns_tokenizer = false;
     t5_encoder * model;
     t5_context * t5ctx;
 

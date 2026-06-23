@@ -119,6 +119,7 @@ struct parler_context : runner_context {
     int32_t n_outputs   = 0; // number of actually-used outputs in the current ubatch or last logical batch
     uint32_t current_position = 0; // current position in the active sequence
     uint32_t prompt_end_position = 0; // the position of the text prompt termination (used for adjusting the cache when incrementally generating)
+    uint32_t first_codebook_unfinished = 0;
 
     std::vector<uint32_t> output_tokens;
     
@@ -180,7 +181,7 @@ void parler_build_kv_store(struct ggml_context * ctx, const parler_kv_cache * kv
 struct ggml_tensor * parler_build_head_outputs(struct ggml_context * ctx, parler_tts_model * model, struct ggml_tensor * cur);
 struct ggml_tensor * build_attn_mask(ggml_context * ctx, parler_context * pctx, parler_ubatch & batch);
 struct ggml_tensor * build_attn_mask_cross(ggml_context * ctx, parler_context * pctx, parler_tts_model * model, parler_ubatch & batch);
-static struct parler_ubatch batch_from_sentence(std::string sentence, parler_tts_model * model, unigram_tokenizer * tokenizer);
+static struct parler_ubatch batch_from_sentence(std::string sentence, parler_tts_model * model, unigram_tokenizer * tokenizer, bool include_audio_start);
 
 // This struct is intended to support end-to-end TTS generation. As such, it manages the parler tts model compilation, compute and generation process,
 // the tokenization and sampling process, and uses the dac_runner struct to encode audio outputs.

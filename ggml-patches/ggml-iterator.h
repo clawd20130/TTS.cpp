@@ -3,7 +3,9 @@
 #include <utility>
 
 #include "ggml.h"
+#if __has_include("gguf.h")
 #include "gguf.h"
+#endif
 
 class gguf_key_iterator {
     const gguf_context * const ctx;

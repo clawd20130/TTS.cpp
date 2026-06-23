@@ -244,6 +244,7 @@ void runner_context::get_ggml_node_data(struct ggml_tensor * output_node, float 
     }
     ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched, output_node);
     ggml_backend_tensor_get_async(backend_res, output_node, output, 0, output_size);
+    ggml_backend_synchronize(backend_res);
 }
 
 void runner_context::set_threads() {
@@ -261,11 +262,11 @@ void runner_context::build_schedule(size_t max_nodes) {
         backend_buffer = tts_backend_get_buffer_type(backend);
         std::vector<ggml_backend_buffer_type_t> bufs = {backend_buffer, backend_cpu_buffer};
         std::vector<ggml_backend_t> backs = {backend, backend_cpu};
-        sched = ggml_backend_sched_new(backs.data(), bufs.data(), 2, max_nodes, false, false);
+        sched = tts_backend_sched_new(backs.data(), bufs.data(), 2, max_nodes, false, true);
     } else {
         std::vector<ggml_backend_buffer_type_t> bufs = {backend_cpu_buffer};
         std::vector<ggml_backend_t> backs = {backend_cpu};
-        sched = ggml_backend_sched_new(backs.data(), bufs.data(), 1, max_nodes, false, false);
+        sched = tts_backend_sched_new(backs.data(), bufs.data(), 1, max_nodes, false, true);
     }
 }
 

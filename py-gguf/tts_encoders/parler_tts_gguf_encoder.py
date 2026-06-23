@@ -43,7 +43,8 @@ class ParlerTTSEncoder(DACEncoder):
         super().__init__(model_path = model_path, architecture = PARLER_TTS_ARCHITECTURE)
         self.text_encoding_prompt = text_encoding_prompt
         self.repo_id = repo_id
-        self._tokenizer = None
+        self._prompt_tokenizer = None
+        self._description_tokenizer = None
         self._model = None
 
     @property
@@ -62,17 +63,36 @@ class ParlerTTSEncoder(DACEncoder):
     def dac_model(self):
         return self.model.audio_encoder.model
 
+    def _load_tokenizer(self, role: str) -> AutoTokenizer:
+        subfolder = f"{role}_tokenizer"
+        try:
+            return AutoTokenizer.from_pretrained(self.repo_id, subfolder=subfolder)
+        except Exception as subfolder_error:
+            try:
+                return AutoTokenizer.from_pretrained(self.repo_id)
+            except Exception as root_error:
+                self.logger.exception(
+                    "Failed to load %s tokenizer from '%s' subfolder or root tokenizer.",
+                    role,
+                    self.repo_id,
+                )
+                raise root_error from subfolder_error
+
+    @property
+    def prompt_tokenizer(self) -> AutoTokenizer:
+        if self._prompt_tokenizer is None:
+            self._prompt_tokenizer = self._load_tokenizer("prompt")
+        return self._prompt_tokenizer
+
+    @property
+    def description_tokenizer(self) -> AutoTokenizer:
+        if self._description_tokenizer is None:
+            self._description_tokenizer = self._load_tokenizer("description")
+        return self._description_tokenizer
+
     @property
     def tokenizer(self) -> AutoTokenizer:
-        if self._tokenizer is None:
-            try:
-                self._tokenizer = AutoTokenizer.from_pretrained(self.repo_id)
-            except Exception as e:
-                self.logger.exception(
-                    f"Failed with exception, {e}, when attempting to obtain obtain tokenizer at path or repo: '{self.repo_id}'"
-                )
-                raise e
-        return self._tokenizer
+        return self.prompt_tokenizer
 
     def prepare_tensors(self):
         """
@@ -90,7 +110,7 @@ class ParlerTTSEncoder(DACEncoder):
         :param str prompt: the conditional prompt to use to define the TTS voice. This should be a short
             description of how the voice should sound.
         """
-        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
+        input_ids = self.description_tokenizer(prompt, return_tensors="pt").input_ids
         model_kwargs = {"input_ids": input_ids}
         inputs_tensor, model_input_name, model_kwargs = self.model._prepare_model_inputs(
             None, self.model.generation_config.bos_token_id, model_kwargs
@@ -187,16 +207,17 @@ class ParlerTTSEncoder(DACEncoder):
         The purpose of this function is to add the vocab and configuration for the Parler TTS unigram tokenizer
         to the GGUF file writer.
         """
-        assert hasattr(self.tokenizer, "_tokenizer") \
-               and hasattr(self.tokenizer._tokenizer, "model") \
-               and isinstance(self.tokenizer._tokenizer.model, Unigram), f"Found non-unigram tokenizer. Currently tokenizer of type {tokenizer.__class__} is not supported."
-        vocab = {v: k for k, v in self.tokenizer.vocab.items()}
+        tokenizer = self.prompt_tokenizer
+        assert hasattr(tokenizer, "_tokenizer") \
+               and hasattr(tokenizer._tokenizer, "model") \
+               and isinstance(tokenizer._tokenizer.model, Unigram), f"Found non-unigram tokenizer. Currently tokenizer of type {tokenizer.__class__} is not supported."
+        vocab = {v: k for k, v in tokenizer.vocab.items()}
         ordered_vocab = [vocab[i].replace('▁', " ") for i in range(max(vocab.keys()) + 1)]
-        scores_by_token = {token: score for (token, score) in json.loads(self.tokenizer._tokenizer.to_str())['model']['vocab']}
+        scores_by_token = {token: score for (token, score) in json.loads(tokenizer._tokenizer.to_str())['model']['vocab']}
         scores = [scores_by_token[vocab[i]] for i in range(max(vocab.keys()) + 1)]
         self.gguf_writer.add_token_list(ordered_vocab)
         self.gguf_writer.add_token_scores(scores)
         self.gguf_writer.add_eos_token_id(self.model.config.text_encoder.eos_token_id)
-        self.gguf_writer.add_unk_token_id(self.tokenizer.unk_token_id)
+        self.gguf_writer.add_unk_token_id(tokenizer.unk_token_id)
         self.gguf_writer.add_add_bos_token(False)
         self.gguf_writer.add_add_eos_token(True)

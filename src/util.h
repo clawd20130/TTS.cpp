@@ -16,8 +16,13 @@
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#if __has_include("gguf.h")
+#include "gguf.h"
+#endif
 #include "ggml-impl.h"
 #include "ggml-cpp.h"
+
+[[noreturn]] void tts_abort(const char * file, int line, const char * fmt, ...);
 
 #define TTS_ABORT(...) tts_abort(__FILE__, __LINE__, __VA_ARGS__)
 #define TTS_ASSERT(x) if (!(x)) TTS_ABORT("TTS_ASSERT(%s) failed", #x)
@@ -55,6 +60,84 @@ void uv_noise_compute(struct ggml_tensor * dst, const struct ggml_tensor * a, co
 
 struct ggml_tensor * reciprocal(ggml_context * ctx, struct ggml_tensor * x);
 
+template <typename Fn>
+auto tts_backend_sched_new_impl(Fn fn,
+        ggml_backend_t * backends,
+        ggml_backend_buffer_type_t * bufts,
+        int n_backends,
+        size_t graph_size,
+        bool parallel,
+        bool op_offload,
+        int) -> decltype(fn(backends, bufts, n_backends, graph_size, parallel, op_offload)) {
+    return fn(backends, bufts, n_backends, graph_size, parallel, op_offload);
+}
+
+inline ggml_backend_sched_t tts_backend_sched_new_impl(
+        ggml_backend_sched_t (*fn)(ggml_backend_t *, ggml_backend_buffer_type_t *, int, size_t, bool),
+        ggml_backend_t * backends,
+        ggml_backend_buffer_type_t * bufts,
+        int n_backends,
+        size_t graph_size,
+        bool parallel,
+        bool op_offload,
+        long) {
+    (void) op_offload;
+    return fn(backends, bufts, n_backends, graph_size, parallel);
+}
+
+inline ggml_backend_sched_t tts_backend_sched_new(
+        ggml_backend_t * backends,
+        ggml_backend_buffer_type_t * bufts,
+        int n_backends,
+        size_t graph_size,
+        bool parallel,
+        bool op_offload) {
+    return tts_backend_sched_new_impl(&ggml_backend_sched_new, backends, bufts, n_backends, graph_size, parallel, op_offload, 0);
+}
+
+template <typename Fn>
+auto tts_conv_transpose_1d_impl(Fn fn,
+        ggml_context * ctx,
+        ggml_tensor * a,
+        ggml_tensor * b,
+        int s0,
+        int p0,
+        int d0,
+        int op0,
+        int g0,
+        int) -> decltype(fn(ctx, a, b, s0, p0, d0, op0, g0)) {
+    return fn(ctx, a, b, s0, p0, d0, op0, g0);
+}
+
+inline ggml_tensor * tts_conv_transpose_1d_impl(
+        ggml_tensor * (*fn)(ggml_context *, ggml_tensor *, ggml_tensor *, int, int, int),
+        ggml_context * ctx,
+        ggml_tensor * a,
+        ggml_tensor * b,
+        int s0,
+        int p0,
+        int d0,
+        int op0,
+        int g0,
+        long) {
+    if (op0 != 0 || g0 != 1) {
+        TTS_ABORT("latest upstream ggml conv_transpose_1d does not support output_padding=%d or groups=%d in the TTS.cpp compatibility path.\n", op0, g0);
+    }
+    return fn(ctx, a, b, s0, p0, d0);
+}
+
+inline ggml_tensor * tts_conv_transpose_1d(
+        ggml_context * ctx,
+        ggml_tensor * a,
+        ggml_tensor * b,
+        int s0,
+        int p0,
+        int d0,
+        int op0,
+        int g0) {
+    return tts_conv_transpose_1d_impl(&ggml_conv_transpose_1d, ctx, a, b, s0, p0, d0, op0, g0, 0);
+}
+
 bool has_suffix(std::string value, std::string suffix);
 bool has_prefix(std::string value, std::string prefix);
 
@@ -62,7 +145,5 @@ std::vector<std::string> split(std::string target, std::string split_on, bool in
 std::vector<std::string> split(std::string target, const char split_on, bool include_split_characters = false);
 std::string strip(std::string target, std::string vals = " ");
 std::string replace_any(std::string target, std::string to_replace, std::string replacement);
-
-[[noreturn]] void tts_abort(const char * file, int line, const char * fmt, ...);
 
 #endif

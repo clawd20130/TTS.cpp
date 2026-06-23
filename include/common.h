@@ -21,13 +21,15 @@ enum tts_arch {
 	KOKORO_ARCH = 1,
 	DIA_ARCH = 2,
 	ORPHEUS_ARCH = 3,
+	STYLE_BERT_VITS2_ARCH = 4,
 };
 
 const std::map<std::string, tts_arch> SUPPORTED_ARCHITECTURES = {
 	{ "parler-tts", PARLER_TTS_ARCH },
 	{ "kokoro", KOKORO_ARCH },
 	{ "dia", DIA_ARCH },
-	{ "orpheus", ORPHEUS_ARCH }
+	{ "orpheus", ORPHEUS_ARCH },
+	{ "style-bert-vits2", STYLE_BERT_VITS2_ARCH }
 };
 
 /// Given a map from keys to values, creates a new map from values to keys
