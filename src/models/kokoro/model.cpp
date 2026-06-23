@@ -2088,6 +2088,14 @@ void kokoro_runner::run(kokoro_ubatch & batch, tts_response & outputs) {
     ggml_backend_sched_reset(kctx->sched);
     const auto t_done = std::chrono::steady_clock::now();
     outputs.n_outputs = total_length*model->up_sampling_factor;
+    outputs.kokoro_duration_lengths.assign(
+        batch.resp->lengths,
+        batch.resp->lengths + batch.resp->n_outputs);
+    outputs.kokoro_token_ids.assign(
+        batch.input_tokens,
+        batch.input_tokens + batch.n_tokens);
+    outputs.kokoro_duration_frames = total_length;
+    outputs.kokoro_duration_frame_samples = model->up_sampling_factor;
     free(batch.resp);
     if (debug_timings) {
         std::cerr << "KOKORO_TIMING phase=generate"

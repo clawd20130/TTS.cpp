@@ -189,6 +189,13 @@ struct simple_server_task {
     std::vector<float> style_bert_m_p;
     std::vector<float> style_bert_logs_p;
     std::vector<float> style_bert_noise;
+    std::vector<float> style_bert_alignment_w;
+    std::vector<float> style_bert_alignment_w_ceil;
+    uint32_t style_bert_alignment_frames = 0;
+    std::vector<float> kokoro_duration_lengths;
+    std::vector<uint32_t> kokoro_token_ids;
+    uint32_t kokoro_duration_frames = 0;
+    uint32_t kokoro_duration_frame_samples = 0;
     std::vector<int32_t> style_bert_phone_ids;
     std::vector<int32_t> style_bert_tone_ids;
     std::vector<int32_t> style_bert_language_ids;
@@ -204,6 +211,8 @@ struct simple_server_task {
     float style_bert_length_scale = 1.0f;
     float style_bert_noise_scale = 0.6f;
     float style_bert_noise_w_scale = 0.8f;
+    bool style_bert_return_alignment = false;
+    bool return_alignment = false;
 
     bool timed_out(int t) {
         auto now = std::chrono::steady_clock::now();
@@ -355,6 +364,10 @@ struct worker {
                 task->response    = (void *) data->data;
                 task->length      = data->n_outputs;
                 task->sample_rate = runner.sampling_rate;
+                task->kokoro_duration_lengths = data->kokoro_duration_lengths;
+                task->kokoro_token_ids = data->kokoro_token_ids;
+                task->kokoro_duration_frames = data->kokoro_duration_frames;
+                task->kokoro_duration_frame_samples = data->kokoro_duration_frame_samples;
                 task->success     = data->n_outputs != 0;
                 response_map->push(task);
                 break;
@@ -456,6 +469,9 @@ struct worker {
                                                    task->style_bert_logs_p.data(),
                                                    task->style_bert_tokens,
                                                    task->style_bert_length_scale);
+                task->style_bert_alignment_w = alignment.w;
+                task->style_bert_alignment_w_ceil = alignment.w_ceil;
+                task->style_bert_alignment_frames = alignment.frames;
                 const size_t expected_noise =
                     (size_t) style_runner->model->inter_channels * alignment.frames;
                 if (task->style_bert_noise.size() != expected_noise) {
@@ -570,6 +586,9 @@ struct worker {
                                                    logs_p.data(),
                                                    (uint32_t) tokens,
                                                    task->style_bert_length_scale);
+                task->style_bert_alignment_w = alignment.w;
+                task->style_bert_alignment_w_ceil = alignment.w_ceil;
+                task->style_bert_alignment_frames = alignment.frames;
                 std::vector<float> noise((size_t) style_runner->model->inter_channels * alignment.frames);
                 random_normal_gen((int) noise.size(), noise.data());
                 std::vector<float> decoder_z;
@@ -1173,6 +1192,46 @@ int main(int argc, const char ** argv) {
         res.status = 200;
     };
 
+    auto style_bert_alignment_json = [](const simple_server_task * rtask,
+                                        const std::vector<uint8_t> & audio,
+                                        const std::string & audio_format) {
+        json alignment = {
+            {"frames", rtask->style_bert_alignment_frames},
+            {"w", rtask->style_bert_alignment_w},
+            {"w_ceil", rtask->style_bert_alignment_w_ceil},
+        };
+        return json {
+            {"status", "ok"},
+            {"audio_format", audio_format},
+            {"audio_wav_base64", base64_encode_bytes(audio.data(), audio.size())},
+            {"sample_rate", rtask->sample_rate},
+            {"audio_samples", rtask->length},
+            {"alignment", alignment},
+        };
+    };
+
+    auto kokoro_alignment_json = [](const simple_server_task * rtask,
+                                    const std::vector<uint8_t> & audio,
+                                    const std::string & audio_format) {
+        const float frame_seconds = rtask->sample_rate > 0.0f ?
+            (float)rtask->kokoro_duration_frame_samples / rtask->sample_rate : 0.0f;
+        json alignment = {
+            {"duration_lengths", rtask->kokoro_duration_lengths},
+            {"token_ids", rtask->kokoro_token_ids},
+            {"duration_frames", rtask->kokoro_duration_frames},
+            {"frame_samples", rtask->kokoro_duration_frame_samples},
+            {"frame_seconds", frame_seconds},
+        };
+        return json {
+            {"status", "ok"},
+            {"audio_format", audio_format},
+            {"audio_wav_base64", base64_encode_bytes(audio.data(), audio.size())},
+            {"sample_rate", rtask->sample_rate},
+            {"audio_samples", rtask->length},
+            {"alignment", alignment},
+        };
+    };
+
     svr->set_exception_handler([&res_error](const httplib::Request &, httplib::Response & res, const std::exception_ptr & ep) {
         std::string message;
         try {
@@ -1241,6 +1300,8 @@ int main(int argc, const char ** argv) {
         &rmap,
         &res_error,
         &res_ok_audio,
+        &res_ok_json,
+        &kokoro_alignment_json,
         &default_generation_config,
         &model_map,
         &default_model
@@ -1310,6 +1371,7 @@ int main(int argc, const char ** argv) {
         if (data.contains("input_phonemes") && data.at("input_phonemes").is_boolean()) {
             conf.input_phonemes = data.at("input_phonemes").get<bool>();
         }
+        task->return_alignment = json_value(data, "return_alignment", false);
 
         if (data.contains("model") && data.at("model").is_string()) {
             const std::string model = data.at("model");
@@ -1344,6 +1406,11 @@ int main(int argc, const char ** argv) {
         if (!success) {
             json formatted_error = format_error_response("failed to write audio data", ERROR_TYPE_SERVER);
             res_error(res, formatted_error);
+            return;
+        }
+
+        if (rtask->return_alignment) {
+            res_ok_json(res, kokoro_alignment_json(rtask, audio, mime_type == MIMETYPE_AIFF ? "aiff" : "wav"));
             return;
         }
 
@@ -1532,6 +1599,8 @@ int main(int argc, const char ** argv) {
         &rmap,
         &res_error,
         &res_ok_audio,
+        &res_ok_json,
+        &style_bert_alignment_json,
         &model_map,
         &default_model
     ](const httplib::Request & req, httplib::Response & res) {
@@ -1610,6 +1679,7 @@ int main(int argc, const char ** argv) {
         task->style_bert_tokens = (uint32_t) tokens;
         task->style_bert_length_scale = json_value(data, "length_scale", 1.0f);
         task->style_bert_noise_scale = json_value(data, "noise_scale", 0.6f);
+        task->style_bert_return_alignment = json_value(data, "return_alignment", false);
 
         tqueue->push(task);
         struct simple_server_task * rtask = rmap->get(id);
@@ -1624,6 +1694,10 @@ int main(int argc, const char ** argv) {
             res_error(res, format_error_response("failed to write audio data", ERROR_TYPE_SERVER));
             return;
         }
+        if (task->style_bert_return_alignment) {
+            res_ok_json(res, style_bert_alignment_json(rtask, audio, mime_type == MIMETYPE_AIFF ? "aiff" : "wav"));
+            return;
+        }
         res_ok_audio(res, audio, mime_type);
     };
 
@@ -1632,6 +1706,8 @@ int main(int argc, const char ** argv) {
         &rmap,
         &res_error,
         &res_ok_audio,
+        &res_ok_json,
+        &style_bert_alignment_json,
         &model_map,
         &default_model
     ](const httplib::Request & req, httplib::Response & res) {
@@ -1705,6 +1781,7 @@ int main(int argc, const char ** argv) {
             data,
             "sdp_noise_scale",
             json_value(data, "noise_w_scale", json_value(data, "noise_w", 0.8f)));
+        task->style_bert_return_alignment = json_value(data, "return_alignment", false);
 
         tqueue->push(task);
         struct simple_server_task * rtask = rmap->get(id);
@@ -1719,6 +1796,10 @@ int main(int argc, const char ** argv) {
             res_error(res, format_error_response("failed to write audio data", ERROR_TYPE_SERVER));
             return;
         }
+        if (task->style_bert_return_alignment) {
+            res_ok_json(res, style_bert_alignment_json(rtask, audio, mime_type == MIMETYPE_AIFF ? "aiff" : "wav"));
+            return;
+        }
         res_ok_audio(res, audio, mime_type);
     };
 
@@ -1727,6 +1808,8 @@ int main(int argc, const char ** argv) {
         &rmap,
         &res_error,
         &res_ok_audio,
+        &res_ok_json,
+        &style_bert_alignment_json,
         &model_map,
         &default_model
     ](const httplib::Request & req, httplib::Response & res) {
@@ -1811,6 +1894,7 @@ int main(int argc, const char ** argv) {
             data,
             "sdp_noise_scale",
             json_value(data, "noise_w_scale", json_value(data, "noise_w", 0.8f)));
+        task->style_bert_return_alignment = json_value(data, "return_alignment", false);
 
         tqueue->push(task);
         struct simple_server_task * rtask = rmap->get(id);
@@ -1823,6 +1907,10 @@ int main(int argc, const char ** argv) {
         bool success = write_audio_data((float *)rtask->response, rtask->length, audio, audio_type, rtask->sample_rate, 440.f, 1, true);
         if (!success) {
             res_error(res, format_error_response("failed to write audio data", ERROR_TYPE_SERVER));
+            return;
+        }
+        if (task->style_bert_return_alignment) {
+            res_ok_json(res, style_bert_alignment_json(rtask, audio, mime_type == MIMETYPE_AIFF ? "aiff" : "wav"));
             return;
         }
         res_ok_audio(res, audio, mime_type);

@@ -14,6 +14,10 @@ struct tts_response {
 	float * data;
 	size_t n_outputs = 0;
 	uint32_t hidden_size; // this parameter is only currently used by the t5_encoder for which n_outputs corresponds to sequence length;
+	std::vector<float> kokoro_duration_lengths;
+	std::vector<uint32_t> kokoro_token_ids;
+	uint32_t kokoro_duration_frames = 0;
+	uint32_t kokoro_duration_frame_samples = 0;
 };
 
 enum tts_arch {

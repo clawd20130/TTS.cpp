@@ -227,6 +227,18 @@ void append_to_response(tts_response & response, tts_response & to_append) {
     }
     response.data = new_data;
     response.n_outputs += to_append.n_outputs;
+    response.kokoro_duration_lengths.insert(
+        response.kokoro_duration_lengths.end(),
+        to_append.kokoro_duration_lengths.begin(),
+        to_append.kokoro_duration_lengths.end());
+    response.kokoro_token_ids.insert(
+        response.kokoro_token_ids.end(),
+        to_append.kokoro_token_ids.begin(),
+        to_append.kokoro_token_ids.end());
+    response.kokoro_duration_frames += to_append.kokoro_duration_frames;
+    if (response.kokoro_duration_frame_samples == 0) {
+        response.kokoro_duration_frame_samples = to_append.kokoro_duration_frame_samples;
+    }
 }
 
 /*
