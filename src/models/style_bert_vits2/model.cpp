@@ -51,7 +51,7 @@ static std::string_view attention_mode() {
     if (experiment && experiment[0]) {
         return std::string_view(experiment);
     }
-    return "values";
+    return "full";
 }
 
 static uint32_t flow_group_size_env(uint32_t max_layers) {

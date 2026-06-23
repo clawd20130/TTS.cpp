@@ -149,9 +149,14 @@ static bool env_enabled(const char * name) {
 static json style_bert_vits2_runtime_config() {
     const bool flow_fused = env_enabled("STYLE_BERT_VITS2_FLOW_FUSED");
     const std::string flow_group_size = env_string_or_default("STYLE_BERT_VITS2_FLOW_GROUP_SIZE", "1");
+    std::string attention_mode = env_string_or_default("STYLE_BERT_VITS2_ATTENTION_MODE", "");
+    if (attention_mode.empty()) {
+        attention_mode = env_string_or_default("STYLE_BERT_VITS2_ATTENTION_EXPERIMENT", "full");
+    }
     return {
         {"backend_env", env_string_or_default("TTS_BACKEND", "auto")},
         {"device_env", env_string_or_default("TTS_DEVICE", "")},
+        {"attention_mode", attention_mode},
         {"debug_timings", env_enabled("STYLE_BERT_VITS2_DEBUG_TIMINGS")},
         {"flow_fused", flow_fused},
         {"flow_group_size", flow_group_size},
