@@ -15,9 +15,12 @@ add_library(tts
         util.cpp
         util.h
         args.cpp
+        style_bert_vits2_c_api.cpp
         tts_model.cpp
         tts_model.h
 )
+
+target_compile_definitions(tts PRIVATE TTS_BUILD)
 
 get_target_property(TTS_GGML_ACTIVE_SOURCE_DIR ggml SOURCE_DIR)
 target_include_directories(tts PUBLIC . ../include "${TTS_GGML_ACTIVE_SOURCE_DIR}")

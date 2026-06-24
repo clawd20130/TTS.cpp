@@ -113,6 +113,7 @@ get_target_property(GGML_LINK_LIBRARIES ggml LINK_LIBRARIES)
 # all public headers
 set(TTS_PUBLIC_HEADERS
     include/common.h
+    include/tts_style_bert_vits2_c_api.h
     include/tts.h
     include/audio_file.h
     include/args.h
