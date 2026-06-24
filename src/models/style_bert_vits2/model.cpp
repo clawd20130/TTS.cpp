@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <format>
@@ -3774,8 +3775,12 @@ void style_bert_vits2_runner::decode(const float * decoder_z_nct, const float * 
     }
 }
 
-void style_bert_vits2_runner::generate(const char *, tts_response &, const generation_configuration &) {
-    TTS_ABORT("Style-Bert-VITS2 GGML currently exposes decoder inference only. Use the debug backend sidecar with explicit phones/tones.\n");
+void style_bert_vits2_runner::generate(const char *, tts_response & output, const generation_configuration &) {
+    std::fprintf(stderr,
+                 "Style-Bert-VITS2 GGML does not support generic text generation yet. "
+                 "Use synthesize_front with explicit phones, tones, language ids, and BERT features.\n");
+    output.data = nullptr;
+    output.n_outputs = 0;
 }
 
 style_bert_vits2_context * build_new_style_bert_vits2_context(style_bert_vits2_model * model, int n_threads, bool use_cpu) {

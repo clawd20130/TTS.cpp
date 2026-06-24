@@ -599,6 +599,10 @@ void style_bert_vits2_jp_bert_runner::encode_features(const int32_t * input_ids,
     ggml_backend_sched_reset(bctx->sched);
 }
 
-void style_bert_vits2_jp_bert_runner::generate(const char *, tts_response &, const generation_configuration &) {
-    TTS_ABORT("Style-Bert-VITS2 JP BERT generation is not implemented yet; use the feature runner entrypoint once wired.\n");
+void style_bert_vits2_jp_bert_runner::generate(const char *, tts_response & output, const generation_configuration &) {
+    std::fprintf(stderr,
+                 "Style-Bert-VITS2 JP-BERT does not support generic text generation. "
+                 "Use encode_features or the /v1/style-bert-vits2/jp-bert/features server endpoint.\n");
+    output.data = nullptr;
+    output.n_outputs = 0;
 }

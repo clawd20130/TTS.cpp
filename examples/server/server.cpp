@@ -223,6 +223,20 @@ struct simple_server_task {
     }
 };
 
+static std::string generic_tts_unsupported_message(const tts_generation_runner & runner) {
+    const char * arch = runner.loader.get().arch;
+    if (std::strcmp(arch, "style-bert-vits2") == 0) {
+        return "Style-Bert-VITS2 does not support /v1/audio/speech text generation yet. "
+               "Use /v1/style-bert-vits2/synthesize-front or /v1/style-bert-vits2/synthesize-symbols "
+               "with explicit frontend tensors.";
+    }
+    if (std::strcmp(arch, "style-bert-vits2-jp-bert") == 0) {
+        return "Style-Bert-VITS2 JP-BERT does not support /v1/audio/speech text generation. "
+               "Use /v1/style-bert-vits2/jp-bert/features for BERT feature extraction.";
+    }
+    return "";
+}
+
 struct simple_task_queue {
     std::mutex rw_mutex;
     std::condition_variable condition;
@@ -357,7 +371,14 @@ struct worker {
         tts_response * data = nullptr;
         tts_generation_runner & runner{*runners[task->model]};
         switch(task->task) {
-            case TTS:
+            case TTS: {
+                const std::string unsupported_message = generic_tts_unsupported_message(runner);
+                if (!unsupported_message.empty()) {
+                    task->success = false;
+                    task->message = unsupported_message;
+                    response_map->push(task);
+                    break;
+                }
                 data              = new tts_response;
                 runner.generate(task->prompt.c_str(), *data, task->gen_config);
                 task->response    = (void *) data->data;
@@ -368,8 +389,12 @@ struct worker {
                 task->kokoro_duration_frames = data->kokoro_duration_frames;
                 task->kokoro_duration_frame_samples = data->kokoro_duration_frame_samples;
                 task->success     = data->n_outputs != 0;
+                if (!task->success) {
+                    task->message = "Model returned an empty response.";
+                }
                 response_map->push(task);
                 break;
+            }
             case CONDITIONAL_PROMPT:
                 if (text_encoder_path.size() == 0) {
                     task->message = "A text encoder path must be specified on server initialization in order to support conditional prompting.";
