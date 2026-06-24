@@ -1,6 +1,7 @@
 #include "model.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <format>
 #include <iostream>
+#include <map>
 #include <string_view>
 
 namespace {
@@ -26,6 +28,11 @@ static std::string style_shape(const ggml_tensor * tensor) {
 
 static bool debug_timings_enabled() {
     const char * env = std::getenv("STYLE_BERT_VITS2_DEBUG_TIMINGS");
+    return env && env[0] && std::strcmp(env, "0") != 0;
+}
+
+static bool profile_decoder_nodes_enabled() {
+    const char * env = std::getenv("STYLE_BERT_VITS2_PROFILE_DECODER_NODES");
     return env && env[0] && std::strcmp(env, "0") != 0;
 }
 
@@ -64,6 +71,25 @@ static bool metal_fused_conv_transpose1d_enabled() {
     const bool backend_is_metal = backend && std::strcmp(backend, "metal") == 0;
     const char * env = std::getenv("STYLE_BERT_VITS2_METAL_FUSED_CONV_TRANSPOSE_1D");
     return env && env[0] ? std::strcmp(env, "0") != 0 : backend_is_metal;
+}
+
+static std::string_view metal_fused_conv1d_mode() {
+    const char * backend = std::getenv("TTS_BACKEND");
+    const bool backend_is_metal = backend && std::strcmp(backend, "metal") == 0;
+    if (!backend_is_metal) {
+        return "off";
+    }
+    const char * env = std::getenv("STYLE_BERT_VITS2_METAL_FUSED_CONV1D");
+    if (!env || !env[0]) {
+        return "full";
+    }
+    if (std::strcmp(env, "0") == 0 || std::strcmp(env, "off") == 0) {
+        return "off";
+    }
+    if (std::strcmp(env, "bias") == 0 || std::strcmp(env, "bias_only") == 0) {
+        return "bias";
+    }
+    return "full";
 }
 
 static bool metal_fused_upsample_pre_relu_enabled() {
@@ -130,21 +156,163 @@ static double elapsed_ms(std::chrono::steady_clock::time_point start,
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+struct style_bert_vits2_node_profile_entry {
+    ggml_tensor * node = nullptr;
+    double total_ms = 0.0;
+    uint32_t samples = 0;
+};
+
+struct style_bert_vits2_node_profile_state {
+    std::vector<style_bert_vits2_node_profile_entry> entries;
+    ggml_tensor * active_node = nullptr;
+    std::chrono::steady_clock::time_point active_start;
+};
+
+static int style_bert_vits2_profile_node_index(const style_bert_vits2_node_profile_state * state, ggml_tensor * node) {
+    for (size_t i = 0; i < state->entries.size(); ++i) {
+        if (state->entries[i].node == node) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+static bool style_bert_vits2_node_profile_callback(ggml_tensor * node, bool ask, void * user_data) {
+    auto * state = static_cast<style_bert_vits2_node_profile_state *>(user_data);
+    if (ask) {
+        state->active_node = node;
+        state->active_start = std::chrono::steady_clock::now();
+        return true;
+    }
+
+    const auto t_done = std::chrono::steady_clock::now();
+    const int index = style_bert_vits2_profile_node_index(state, node);
+    if (index >= 0) {
+        state->entries[(size_t) index].total_ms += elapsed_ms(state->active_start, t_done);
+        state->entries[(size_t) index].samples += 1;
+    }
+    state->active_node = nullptr;
+    return true;
+}
+
+static void style_bert_vits2_print_node_profile(const style_bert_vits2_node_profile_state & state) {
+    std::vector<size_t> order;
+    order.reserve(state.entries.size());
+    double total_ms = 0.0;
+    std::map<std::string, double> op_total_ms;
+    std::map<std::string, uint32_t> op_samples;
+
+    for (size_t i = 0; i < state.entries.size(); ++i) {
+        const style_bert_vits2_node_profile_entry & entry = state.entries[i];
+        if (entry.samples == 0) {
+            continue;
+        }
+        order.push_back(i);
+        total_ms += entry.total_ms;
+        const char * op = ggml_op_name(entry.node->op);
+        op_total_ms[op] += entry.total_ms;
+        op_samples[op] += entry.samples;
+    }
+
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return state.entries[a].total_ms > state.entries[b].total_ms;
+    });
+
+    std::vector<std::pair<std::string, double>> op_order;
+    op_order.reserve(op_total_ms.size());
+    for (const auto & item : op_total_ms) {
+        op_order.push_back(item);
+    }
+    std::sort(op_order.begin(), op_order.end(), [](const auto & a, const auto & b) {
+        return a.second > b.second;
+    });
+
+    std::fprintf(stderr, "STYLE_BERT_VITS2_DECODER_NODE_PROFILE nodes=%zu observed=%zu total_ms=%.3f by_op=",
+                 state.entries.size(), order.size(), total_ms);
+    const size_t op_limit = std::min<size_t>(op_order.size(), 16);
+    for (size_t i = 0; i < op_limit; ++i) {
+        const std::string & op = op_order[i].first;
+        if (i > 0) {
+            std::fputc(',', stderr);
+        }
+        std::fprintf(stderr, "%s:%.3f/%u", op.c_str(), op_order[i].second, op_samples[op]);
+    }
+    std::fputc('\n', stderr);
+
+    const size_t node_limit = std::min<size_t>(order.size(), 60);
+    for (size_t rank = 0; rank < node_limit; ++rank) {
+        const style_bert_vits2_node_profile_entry & entry = state.entries[order[rank]];
+        const ggml_tensor * node = entry.node;
+        const char * name = ggml_get_name(node);
+        std::fprintf(stderr,
+                     "STYLE_BERT_VITS2_DECODER_NODE_PROFILE_NODE rank=%zu ms=%.3f samples=%u op=%s name=%s type=%s "
+                     "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                     rank + 1,
+                     entry.total_ms,
+                     entry.samples,
+                     ggml_op_name(node->op),
+                     name && name[0] ? name : "<unnamed>",
+                     ggml_type_name(node->type),
+                     node->ne[0],
+                     node->ne[1],
+                     node->ne[2],
+                     node->ne[3]);
+    }
+}
+
 static bool debug_node_matches(ggml_tensor * tensor, const char * target) {
     return target && tensor && std::strcmp(ggml_get_name(tensor), target) == 0;
 }
 
-static ggml_tensor * conv1d(ggml_context * ctx, const style_bert_vits2_conv1d & conv, ggml_tensor * input) {
+static ggml_tensor * conv1d(
+    ggml_context * ctx,
+    const style_bert_vits2_conv1d & conv,
+    ggml_tensor * input,
+    float pre_relu_slope = -1.0f,
+    ggml_tensor * residual = nullptr) {
     TTS_ASSERT(conv.weight);
     TTS_ASSERT(input);
     const uint32_t min_tiled_output = metal_tiled_conv1d_min_output();
     const int64_t output_length =
         (input->ne[0] + 2 * (int64_t) conv.padding - (int64_t) conv.dilation * (conv.weight->ne[0] - 1) - 1) + 1;
-    ggml_tensor * cur = output_length >= 0 && (uint32_t) output_length >= min_tiled_output
-        ? ggml_kokoro_conv_1d(ctx, conv.weight, input, 1, (int) conv.padding, (int) conv.dilation)
-        : ggml_conv_1d(ctx, conv.weight, input, 1, (int) conv.padding, (int) conv.dilation);
-    if (conv.bias) {
+    const bool use_tiled = output_length >= 0 && (uint32_t) output_length >= min_tiled_output;
+    const std::string_view fused_mode = metal_fused_conv1d_mode();
+    if (use_tiled && conv.bias && fused_mode == "full") {
+        return ggml_kokoro_conv_1d_ex(ctx,
+                                      conv.weight,
+                                      input,
+                                      conv.bias,
+                                      residual,
+                                      1,
+                                      (int) conv.padding,
+                                      (int) conv.dilation,
+                                      pre_relu_slope);
+    }
+    ggml_tensor * conv_input = pre_relu_slope >= 0.0f
+        ? ggml_leaky_relu(ctx, input, pre_relu_slope, false)
+        : input;
+    const bool fuse_bias_only = use_tiled && conv.bias && fused_mode == "bias";
+    ggml_tensor * cur = nullptr;
+    if (fuse_bias_only) {
+        cur = ggml_kokoro_conv_1d_ex(ctx,
+                                     conv.weight,
+                                     conv_input,
+                                     conv.bias,
+                                     nullptr,
+                                     1,
+                                     (int) conv.padding,
+                                     (int) conv.dilation,
+                                     -1.0f);
+    } else {
+        cur = use_tiled
+            ? ggml_kokoro_conv_1d(ctx, conv.weight, conv_input, 1, (int) conv.padding, (int) conv.dilation)
+            : ggml_conv_1d(ctx, conv.weight, conv_input, 1, (int) conv.padding, (int) conv.dilation);
+    }
+    if (conv.bias && !fuse_bias_only) {
         cur = ggml_add(ctx, cur, conv.bias);
+    }
+    if (residual) {
+        cur = ggml_add(ctx, cur, residual);
     }
     return cur;
 }
@@ -1341,11 +1509,8 @@ static ggml_tensor * conv_transpose1d(ggml_context * ctx, const style_bert_vits2
 static ggml_tensor * build_resblock(ggml_context * ctx, ggml_tensor * input, const style_bert_vits2_resblock & block) {
     ggml_tensor * x = input;
     for (size_t i = 0; i < block.convs1.size(); ++i) {
-        ggml_tensor * cur = ggml_leaky_relu(ctx, x, 0.1f, false);
-        cur = conv1d(ctx, block.convs1[i], cur);
-        cur = ggml_leaky_relu(ctx, cur, 0.1f, false);
-        cur = conv1d(ctx, block.convs2[i], cur);
-        x = ggml_add(ctx, cur, x);
+        ggml_tensor * cur = conv1d(ctx, block.convs1[i], x, 0.1f);
+        x = conv1d(ctx, block.convs2[i], cur, 0.1f, x);
     }
     return x;
 }
@@ -3786,10 +3951,27 @@ void style_bert_vits2_runner::decode(const float * decoder_z_nct, const float * 
     const auto t_alloc = std::chrono::steady_clock::now();
     set_decoder_inputs(decoder_z_nct, decoder_g_nct, frames);
     const auto t_inputs = std::chrono::steady_clock::now();
+
+    style_bert_vits2_node_profile_state node_profile;
+    const bool profile_nodes = profile_decoder_nodes_enabled();
+    if (profile_nodes) {
+        node_profile.entries.reserve((size_t) gf->n_nodes);
+        for (int i = 0; i < gf->n_nodes; ++i) {
+            node_profile.entries.push_back(style_bert_vits2_node_profile_entry{gf->nodes[i], 0.0, 0});
+        }
+        ggml_backend_sched_set_eval_callback(sctx->sched, style_bert_vits2_node_profile_callback, &node_profile);
+    }
+
     ggml_backend_sched_graph_compute_async(sctx->sched, gf);
     const auto t_compute = std::chrono::steady_clock::now();
     sctx->get_ggml_node_data(output_tensor, output.data, output_size);
     const auto t_read = std::chrono::steady_clock::now();
+
+    if (profile_nodes) {
+        ggml_backend_sched_set_eval_callback(sctx->sched, nullptr, nullptr);
+        style_bert_vits2_print_node_profile(node_profile);
+    }
+
     output.n_outputs = (size_t) ggml_nelements(output_tensor);
     output.hidden_size = 1;
     ggml_backend_sched_reset(sctx->sched);
