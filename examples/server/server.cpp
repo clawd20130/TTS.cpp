@@ -164,9 +164,11 @@ static json style_bert_vits2_runtime_config() {
     };
 }
 
+static std::atomic<int> next_server_task_id{1};
+
 struct simple_server_task {
     simple_server_task(task_type task, std::string prompt = ""): task(task), prompt(prompt) {
-        id = rand();
+        id = next_server_task_id.fetch_add(1, std::memory_order_relaxed);
         time = std::chrono::steady_clock::now();
     }
 
@@ -301,18 +303,15 @@ struct simple_response_map {
 
     struct simple_server_task * get(int id) {
         std::unique_lock<std::mutex> lock(rw_mutex);
-        struct simple_server_task * resp = nullptr;
-        try {
-            return completed.at(id);
-        } catch (const std::out_of_range& e) {
-            updated.wait(lock, [&]{
-                return completed.find(id) != completed.end() || !running;
-            });
-            if (!running) {
-                return nullptr;
-            }
-            return completed.at(id);
+        updated.wait(lock, [&]{
+            return completed.find(id) != completed.end() || !running;
+        });
+        if (!running) {
+            return nullptr;
         }
+        struct simple_server_task * resp = completed.at(id);
+        completed.erase(id);
+        return resp;
     }
 };
 

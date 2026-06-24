@@ -106,7 +106,9 @@ class StyleBertVits2Encoder(TTSEncoder):
     @property
     def net_g(self) -> Any:
         if self._net_g is None:
-            self._net_g = self.tts_model.net_g
+            self._net_g = getattr(self.tts_model, "net_g", None)
+            if self._net_g is None:
+                self._net_g = getattr(self.tts_model, "_TTSModel__net_g", None)
             if self._net_g is None:
                 raise RuntimeError("Style-Bert-VITS2 TTSModel did not expose net_g after load.")
         return self._net_g

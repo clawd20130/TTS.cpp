@@ -17,7 +17,11 @@ bool env_truthy(const char * value) {
 void setenv_if_empty(const char * name, const char * value) {
     const char * current = std::getenv(name);
     if (!current || !current[0]) {
+#if defined(_WIN32)
+        _putenv_s(name, value);
+#else
         setenv(name, value, 1);
+#endif
     }
 }
 
