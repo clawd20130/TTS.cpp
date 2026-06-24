@@ -1586,7 +1586,7 @@ int main(int argc, const char ** argv) {
         }
 
         std::vector<uint8_t> audio;
-        bool success = write_audio_data((float *)rtask->response, rtask->length, audio, audio_type, rtask->sample_rate, 440.f, 1, true);
+        bool success = write_audio_data((float *)rtask->response, rtask->length, audio, audio_type, rtask->sample_rate);
         if (!success) {
             res_error(res, format_error_response("failed to write audio data", ERROR_TYPE_SERVER));
             return;
@@ -1689,7 +1689,7 @@ int main(int argc, const char ** argv) {
         }
 
         std::vector<uint8_t> audio;
-        bool success = write_audio_data((float *)rtask->response, rtask->length, audio, audio_type, rtask->sample_rate, 440.f, 1, true);
+        bool success = write_audio_data((float *)rtask->response, rtask->length, audio, audio_type, rtask->sample_rate);
         if (!success) {
             res_error(res, format_error_response("failed to write audio data", ERROR_TYPE_SERVER));
             return;
@@ -1791,7 +1791,7 @@ int main(int argc, const char ** argv) {
         }
 
         std::vector<uint8_t> audio;
-        bool success = write_audio_data((float *)rtask->response, rtask->length, audio, audio_type, rtask->sample_rate, 440.f, 1, true);
+        bool success = write_audio_data((float *)rtask->response, rtask->length, audio, audio_type, rtask->sample_rate);
         if (!success) {
             res_error(res, format_error_response("failed to write audio data", ERROR_TYPE_SERVER));
             return;
@@ -1904,7 +1904,7 @@ int main(int argc, const char ** argv) {
         }
 
         std::vector<uint8_t> audio;
-        bool success = write_audio_data((float *)rtask->response, rtask->length, audio, audio_type, rtask->sample_rate, 440.f, 1, true);
+        bool success = write_audio_data((float *)rtask->response, rtask->length, audio, audio_type, rtask->sample_rate);
         if (!success) {
             res_error(res, format_error_response("failed to write audio data", ERROR_TYPE_SERVER));
             return;

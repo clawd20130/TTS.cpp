@@ -288,8 +288,8 @@ struct style_bert_vits2_runner : tts_generation_runner {
         if (ctx) {
             ggml_free(ctx);
         }
-        model->free();
         delete sctx;
+        model->free();
     }
 
     unique_ptr<style_bert_vits2_model> model;

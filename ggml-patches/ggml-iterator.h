@@ -9,13 +9,13 @@
 
 class gguf_key_iterator {
     const gguf_context * const ctx;
-    const int                  n_kv;
-    int                        i{};
+    const int64_t              n_kv;
+    int64_t                    i{};
 
   public:
     explicit gguf_key_iterator(const gguf_context & ctx) : ctx{ &ctx }, n_kv{ gguf_get_n_kv(&ctx) } {}
 
-    std::pair<int, const char *> operator*() const { return { i, gguf_get_key(ctx, i) }; }
+    std::pair<int64_t, const char *> operator*() const { return { i, gguf_get_key(ctx, i) }; }
 
     gguf_key_iterator & operator++() {
         ++i;

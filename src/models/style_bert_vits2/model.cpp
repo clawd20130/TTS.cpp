@@ -37,6 +37,26 @@ static bool flow_fused_enabled() {
     return env && env[0] && std::strcmp(env, "0") != 0;
 }
 
+static uint32_t metal_tiled_conv1d_min_output() {
+    const char * backend = std::getenv("TTS_BACKEND");
+    const bool backend_is_metal = backend && std::strcmp(backend, "metal") == 0;
+    const char * env = std::getenv("STYLE_BERT_VITS2_METAL_TILED_CONV1D");
+    const bool enabled = env && env[0] ? std::strcmp(env, "0") != 0 : backend_is_metal;
+    if (!enabled) {
+        return UINT32_MAX;
+    }
+    const char * min_env = std::getenv("STYLE_BERT_VITS2_METAL_TILED_CONV1D_MIN_OUTPUT");
+    if (!min_env || !min_env[0]) {
+        return 8192;
+    }
+    char * end = nullptr;
+    const unsigned long parsed = std::strtoul(min_env, &end, 10);
+    if (end == min_env || *end != '\0') {
+        return 1;
+    }
+    return (uint32_t) parsed;
+}
+
 static bool attention_legacy_enabled() {
     const char * env = std::getenv("STYLE_BERT_VITS2_ATTENTION_LEGACY");
     return env && env[0] && std::strcmp(env, "0") != 0;
@@ -103,7 +123,12 @@ static bool debug_node_matches(ggml_tensor * tensor, const char * target) {
 static ggml_tensor * conv1d(ggml_context * ctx, const style_bert_vits2_conv1d & conv, ggml_tensor * input) {
     TTS_ASSERT(conv.weight);
     TTS_ASSERT(input);
-    ggml_tensor * cur = ggml_conv_1d(ctx, conv.weight, input, 1, (int) conv.padding, (int) conv.dilation);
+    const uint32_t min_tiled_output = metal_tiled_conv1d_min_output();
+    const int64_t output_length =
+        (input->ne[0] + 2 * (int64_t) conv.padding - (int64_t) conv.dilation * (conv.weight->ne[0] - 1) - 1) + 1;
+    ggml_tensor * cur = output_length >= 0 && (uint32_t) output_length >= min_tiled_output
+        ? ggml_kokoro_conv_1d(ctx, conv.weight, input, 1, (int) conv.padding, (int) conv.dilation)
+        : ggml_conv_1d(ctx, conv.weight, input, 1, (int) conv.padding, (int) conv.dilation);
     if (conv.bias) {
         cur = ggml_add(ctx, cur, conv.bias);
     }
@@ -3598,7 +3623,8 @@ void style_bert_vits2_runner::generate(const char *, tts_response &, const gener
 
 style_bert_vits2_context * build_new_style_bert_vits2_context(style_bert_vits2_model * model, int n_threads, bool use_cpu) {
     style_bert_vits2_context * sctx = new style_bert_vits2_context(model, n_threads);
-    sctx->backend = tts_backend_init_accelerator(use_cpu);
+    sctx->backend = model->backend;
+    sctx->owns_backend = false;
     sctx->backend_cpu = ggml_backend_cpu_init();
     sctx->set_threads();
     const size_t max_nodes = style_bert_vits2_graph_max_nodes(model->max_nodes());

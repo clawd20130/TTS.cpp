@@ -47,7 +47,8 @@ unique_ptr<tts_generation_runner> style_bert_vits2_jp_bert_model_loader::from_fi
     unique_ptr<style_bert_vits2_jp_bert_model> model = make_unique<style_bert_vits2_jp_bert_model>();
     model->setup_from_file(meta_ctx, weight_ctx, cpu_only);
     style_bert_vits2_jp_bert_context * context = new style_bert_vits2_jp_bert_context(&*model, n_threads);
-    context->backend = tts_backend_init_accelerator(cpu_only);
+    context->backend = model->backend;
+    context->owns_backend = false;
     context->backend_cpu = ggml_backend_cpu_init();
     context->set_threads();
     context->build_schedule();

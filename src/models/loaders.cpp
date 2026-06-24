@@ -66,8 +66,8 @@ unique_ptr<tts_generation_runner> runner_from_file(const char * fname, int n_thr
         GGML_ABORT("gguf_init_from_file failed for file %s\n", fname);
     }
     if (use_mmap) {
-        const int n{ gguf_get_n_tensors(&*meta_ctx) };
-        int       i{};
+        const int64_t n{ gguf_get_n_tensors(&*meta_ctx) };
+        int64_t       i{};
         void *    in_buffer{ static_cast<char *>(in_mmap->addr()) + gguf_get_data_offset(meta_ctx) };
         for (ggml_tensor & cur : ggml_tensor_iterator{ *weight_ctx }) {
             GGML_ASSERT(i < n);

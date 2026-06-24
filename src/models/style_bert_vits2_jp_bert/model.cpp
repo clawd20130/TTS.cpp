@@ -160,8 +160,8 @@ style_bert_vits2_jp_bert_runner::style_bert_vits2_jp_bert_runner(
     tts_generation_runner{style_bert_vits2_jp_bert_loader}, model{std::move(model)}, bctx(context) {}
 
 style_bert_vits2_jp_bert_runner::~style_bert_vits2_jp_bert_runner() {
-    model->free();
     delete bctx;
+    model->free();
 }
 
 void style_bert_vits2_jp_bert_runner::assign_weight(const char * name, ggml_tensor & tensor) {

@@ -9,6 +9,9 @@
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
 #include "models/loaders.h"
 
 namespace {
@@ -111,7 +114,16 @@ ggml_backend_t tts_init_requested_accelerator() {
     } else if (tts_iequals(env, "vulkan") || tts_iequals(env, "vk")) {
         backend = tts_init_named_backend("Vulkan");
     } else if (tts_iequals(env, "metal")) {
+#ifdef GGML_USE_METAL
+        const int target_idx = tts_backend_device_index();
+        if (target_idx <= 0) {
+            backend = ggml_backend_metal_init();
+        } else {
+            fprintf(stderr, "  [backend] Requested Metal device index %d not available\n", target_idx);
+        }
+#else
         backend = tts_init_named_backend("Metal");
+#endif
     } else if (tts_iequals(env, "cpu")) {
         return nullptr;
     } else {
@@ -270,7 +282,7 @@ void runner_context::set_threads() {
 
 void runner_context::build_schedule(size_t max_nodes) {
     backend_cpu_buffer = ggml_backend_cpu_buffer_type();
-    if (backend != nullptr) {
+    if (backend != nullptr && !tts_backend_is_cpu(backend)) {
         backend_buffer = tts_backend_get_buffer_type(backend);
         std::vector<ggml_backend_buffer_type_t> bufs = {backend_buffer, backend_cpu_buffer};
         std::vector<ggml_backend_t> backs = {backend, backend_cpu};
@@ -283,7 +295,7 @@ void runner_context::build_schedule(size_t max_nodes) {
 }
 
 void runner_context::set_tensor_backend(ggml_tensor * tensor) {
-    if (backend && tensor) {
+    if (backend && !tts_backend_is_cpu(backend) && tensor) {
         ggml_backend_sched_set_tensor_backend(sched, tensor, backend);
     }
 }

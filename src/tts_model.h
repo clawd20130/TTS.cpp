@@ -24,13 +24,16 @@ struct runner_context {
     virtual ~runner_context() {
         ggml_backend_sched_free(sched);
         ggml_threadpool_free(threadpool);
-        ggml_backend_free(backend_cpu);
-        ggml_backend_free(backend);
         ggml_backend_buffer_free(buf_output);
+        ggml_backend_free(backend_cpu);
+        if (owns_backend) {
+            ggml_backend_free(backend);
+        }
     }
     // TODO: extend the backend and buffer support out to all devices
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_type_t backend_buffer = nullptr;
+    bool owns_backend = true;
 
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_buffer_type_t backend_cpu_buffer = nullptr;
