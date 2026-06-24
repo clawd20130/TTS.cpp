@@ -437,71 +437,33 @@ struct worker {
                     response_map->push(task);
                     break;
                 }
-                const size_t expected_tokens = task->style_bert_tokens;
-                const size_t expected_text =
-                    (size_t) style_runner->model->inter_channels * expected_tokens;
-                if (expected_tokens == 0 ||
-                    task->style_bert_logw.size() != expected_tokens ||
-                    task->style_bert_x_mask.size() != expected_tokens ||
-                    task->style_bert_m_p.size() != expected_text ||
-                    task->style_bert_logs_p.size() != expected_text ||
-                    task->style_bert_decoder_g.size() != style_runner->model->gin_channels) {
-                    task->message = std::format(
-                        "Style-Bert latent input size mismatch: tokens={}, logw={}, x_mask={}, m_p={} expected_m_p={}, logs_p={} expected_logs_p={}, g={} expected_g={}.",
-                        expected_tokens,
-                        task->style_bert_logw.size(),
-                        task->style_bert_x_mask.size(),
-                        task->style_bert_m_p.size(),
-                        expected_text,
-                        task->style_bert_logs_p.size(),
-                        expected_text,
-                        task->style_bert_decoder_g.size(),
-                        style_runner->model->gin_channels);
+                data = new tts_response;
+                style_bert_vits2_alignment_result alignment;
+                std::string error;
+                if (!style_runner->synthesize_latent(task->style_bert_logw,
+                                                     task->style_bert_x_mask,
+                                                     task->style_bert_m_p,
+                                                     task->style_bert_logs_p,
+                                                     task->style_bert_noise,
+                                                     task->style_bert_decoder_g,
+                                                     task->style_bert_tokens,
+                                                     task->style_bert_length_scale,
+                                                     task->style_bert_noise_scale,
+                                                     *data,
+                                                     alignment,
+                                                     error)) {
+                    task->message = error.empty() ? "Style-Bert latent synthesis failed." : error;
+                    delete data;
                     response_map->push(task);
                     break;
                 }
-
-                style_bert_vits2_alignment_result alignment =
-                    style_runner->expand_alignment(task->style_bert_logw.data(),
-                                                   task->style_bert_x_mask.data(),
-                                                   task->style_bert_m_p.data(),
-                                                   task->style_bert_logs_p.data(),
-                                                   task->style_bert_tokens,
-                                                   task->style_bert_length_scale);
                 task->style_bert_alignment_w = alignment.w;
                 task->style_bert_alignment_w_ceil = alignment.w_ceil;
                 task->style_bert_alignment_frames = alignment.frames;
-                const size_t expected_noise =
-                    (size_t) style_runner->model->inter_channels * alignment.frames;
-                if (task->style_bert_noise.size() != expected_noise) {
-                    task->message = std::format("Style-Bert latent noise size mismatch: got {}, expected {} for {} frames.",
-                                                task->style_bert_noise.size(),
-                                                expected_noise,
-                                                alignment.frames);
-                    response_map->push(task);
-                    break;
-                }
-
-                std::vector<float> decoder_z;
-                style_runner->build_decoder_latent(task->style_bert_logw.data(),
-                                                   task->style_bert_x_mask.data(),
-                                                   task->style_bert_m_p.data(),
-                                                   task->style_bert_logs_p.data(),
-                                                   task->style_bert_noise.data(),
-                                                   task->style_bert_decoder_g.data(),
-                                                   task->style_bert_tokens,
-                                                   task->style_bert_length_scale,
-                                                   task->style_bert_noise_scale,
-                                                   decoder_z);
-                data = new tts_response;
-                style_runner->decode(decoder_z.data(),
-                                     task->style_bert_decoder_g.data(),
-                                     alignment.frames,
-                                     *data);
                 task->response    = (void *) data->data;
                 task->length      = data->n_outputs;
                 task->sample_rate = style_runner->sampling_rate;
-                task->success     = data->n_outputs != 0;
+                task->success     = true;
                 response_map->push(task);
                 break;
             }
@@ -512,104 +474,35 @@ struct worker {
                     response_map->push(task);
                     break;
                 }
-                const size_t tokens = task->style_bert_tokens;
-                const size_t expected_bert = tokens * 1024;
-                if (tokens == 0 ||
-                    task->style_bert_phone_ids.size() != tokens ||
-                    task->style_bert_tone_ids.size() != tokens ||
-                    task->style_bert_language_ids.size() != tokens ||
-                    task->style_bert_bert.size() != expected_bert) {
-                    task->message = std::format(
-                        "Style-Bert front input size mismatch: tokens={}, phone_ids={}, tone_ids={}, language_ids={}, bert={} expected_bert={}.",
-                        tokens,
-                        task->style_bert_phone_ids.size(),
-                        task->style_bert_tone_ids.size(),
-                        task->style_bert_language_ids.size(),
-                        task->style_bert_bert.size(),
-                        expected_bert);
+                data = new tts_response;
+                style_bert_vits2_alignment_result alignment;
+                std::string error;
+                if (!style_runner->synthesize_front(task->style_bert_phone_ids,
+                                                    task->style_bert_tone_ids,
+                                                    task->style_bert_language_ids,
+                                                    task->style_bert_bert,
+                                                    task->style_bert_speaker_id,
+                                                    task->style_bert_style_id,
+                                                    task->style_bert_style_weight,
+                                                    task->style_bert_sdp_ratio,
+                                                    task->style_bert_length_scale,
+                                                    task->style_bert_noise_scale,
+                                                    task->style_bert_noise_w_scale,
+                                                    *data,
+                                                    alignment,
+                                                    error)) {
+                    task->message = error.empty() ? "Style-Bert front synthesis failed." : error;
+                    delete data;
                     response_map->push(task);
                     break;
                 }
-
-                std::vector<float> g;
-                std::vector<float> style_vec;
-                std::vector<float> x_mask(tokens, 1.0f);
-                std::vector<float> x;
-                std::vector<float> m_p;
-                std::vector<float> logs_p;
-                std::vector<float> logw;
-                style_runner->encode_speaker(task->style_bert_speaker_id, g);
-                style_runner->encode_style_vector(task->style_bert_style_id, task->style_bert_style_weight, style_vec);
-                style_runner->run_text_encoder(task->style_bert_phone_ids.data(),
-                                               task->style_bert_tone_ids.data(),
-                                               task->style_bert_language_ids.data(),
-                                               task->style_bert_bert.data(),
-                                               style_vec.data(),
-                                               x_mask.data(),
-                                               g.data(),
-                                               (uint32_t) tokens,
-                                               x,
-                                               m_p,
-                                               logs_p);
-                std::vector<float> logw_dp;
-                style_runner->predict_duration(x.data(), x_mask.data(), g.data(), (uint32_t) tokens, logw_dp);
-                logw = logw_dp;
-                if (std::fabs(task->style_bert_sdp_ratio) > 1e-6f) {
-                    std::vector<float> sdp_condition;
-                    style_runner->run_stochastic_duration_condition(x.data(),
-                                                                    x_mask.data(),
-                                                                    g.data(),
-                                                                    (uint32_t) tokens,
-                                                                    sdp_condition);
-                    std::vector<float> sdp_noise((size_t) tokens * 2);
-                    random_normal_gen((int) sdp_noise.size(), sdp_noise.data());
-                    for (float & value : sdp_noise) {
-                        value *= task->style_bert_noise_w_scale;
-                    }
-                    std::vector<float> logw_sdp;
-                    style_runner->run_stochastic_duration_reverse(sdp_noise.data(),
-                                                                  x_mask.data(),
-                                                                  sdp_condition.data(),
-                                                                  (uint32_t) tokens,
-                                                                  logw_sdp);
-                    logw.resize(tokens);
-                    for (size_t i = 0; i < tokens; ++i) {
-                        logw[i] = logw_sdp[i] * task->style_bert_sdp_ratio +
-                                  logw_dp[i] * (1.0f - task->style_bert_sdp_ratio);
-                    }
-                }
-                style_bert_vits2_alignment_result alignment =
-                    style_runner->expand_alignment(logw.data(),
-                                                   x_mask.data(),
-                                                   m_p.data(),
-                                                   logs_p.data(),
-                                                   (uint32_t) tokens,
-                                                   task->style_bert_length_scale);
                 task->style_bert_alignment_w = alignment.w;
                 task->style_bert_alignment_w_ceil = alignment.w_ceil;
                 task->style_bert_alignment_frames = alignment.frames;
-                std::vector<float> noise((size_t) style_runner->model->inter_channels * alignment.frames);
-                random_normal_gen((int) noise.size(), noise.data());
-                std::vector<float> decoder_z;
-                style_runner->build_decoder_latent(logw.data(),
-                                                   x_mask.data(),
-                                                   m_p.data(),
-                                                   logs_p.data(),
-                                                   noise.data(),
-                                                   g.data(),
-                                                   (uint32_t) tokens,
-                                                   task->style_bert_length_scale,
-                                                   task->style_bert_noise_scale,
-                                                   decoder_z);
-                data = new tts_response;
-                style_runner->decode(decoder_z.data(),
-                                     g.data(),
-                                     alignment.frames,
-                                     *data);
                 task->response    = (void *) data->data;
                 task->length      = data->n_outputs;
                 task->sample_rate = style_runner->sampling_rate;
-                task->success     = data->n_outputs != 0;
+                task->success     = true;
                 response_map->push(task);
                 break;
             }

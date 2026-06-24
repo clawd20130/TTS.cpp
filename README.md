@@ -181,6 +181,17 @@ hf download kevinzhow/style-bert-vits2-gguf \
   --local-dir ./tmp/style-bert-vits2-gguf
 ```
 
+Download every voice model that the caller may request. The JP-BERT GGUF is
+shared, but each Style-Bert voice still needs its own `voices/*.gguf` decoder
+model. For example, an application that can select Chu2 or Mai also needs:
+
+```bash
+hf download kevinzhow/style-bert-vits2-gguf \
+  voices/chu2-full-sdp.gguf \
+  voices/mai-full-sdp.gguf \
+  --local-dir ./tmp/style-bert-vits2-gguf
+```
+
 Suggested local asset layout:
 
 ```text
@@ -194,7 +205,8 @@ Run separate decoder and JP-BERT servers:
 # Style-Bert-VITS2 decoder/front-end graph server
 TTS_BACKEND=vulkan TTS_DEVICE=0 TTS_BACKEND_STRICT=1 \
   ./build-vulkan/bin/tts-server \
-  --model-path ./tmp/style-bert-vits2-gguf/voices/jvnv-F1-jp-full-sdp.gguf \
+  --model-path ./tmp/style-bert-vits2-gguf/voices \
+  --default-model jvnv-F1-jp-full-sdp \
   --host 127.0.0.1 \
   --port 18102 \
   --backend vulkan
@@ -215,6 +227,26 @@ For local macOS Metal runs, use the same commands with `build-metal` and
 contains multiple models, pass the desired model ID in each request's `model`
 field or set `--default-model`.
 
+Verify the loaded decoder models before wiring an application or sidecar to the
+server:
+
+```bash
+curl -fsS http://127.0.0.1:18102/v1/models
+```
+
+That endpoint is the source of truth for model IDs accepted by
+`/v1/style-bert-vits2/*` synthesis requests. If a request fails with
+`Invalid Model: chu2-full-sdp`, then `chu2-full-sdp.gguf` was not loaded by the
+decoder server. Download the matching GGUF file, restart the decoder server,
+and re-check `/v1/models`. Do not treat this as a JP-BERT tokenizer, fallback,
+or audio-quality problem.
+
+Common built-in voice model IDs are `jvnv-F1-jp-full-sdp`,
+`jvnv-F2-jp-full-sdp`, `jvnv-M1-jp-full-sdp`, `jvnv-M2-jp-full-sdp`,
+`amitaro-full-sdp`, `koharune-ami-full-sdp`, `mao-full-sdp`,
+`michinoku-airi-full-sdp`, `chu2-full-sdp`, `nise-full-sdp`,
+`kanon-full-sdp`, `mai-full-sdp`, and `runa-full-sdp`.
+
 #### Style-Bert-VITS2 Server Endpoints
 
 The Style-Bert-specific routes are:
@@ -231,6 +263,12 @@ The Style-Bert-specific routes are:
 `speaker_id`, `style_id`, `style_weight`, `sdp_ratio`, `length_scale`,
 `noise_scale`, `sdp_noise_scale`, `response_format`, and `return_alignment`.
 Audio responses currently support `wav` and `aiff`.
+
+The JP-BERT endpoint does not tokenize text. The application must use the same
+Japanese tokenizer used for conversion and send `input_ids` to
+`/v1/style-bert-vits2/jp-bert/features`. Missing tokenizer files are therefore
+an application/sidecar setup issue, while `Invalid Model: <id>` is a decoder
+server loading issue.
 
 #### Style-Bert-VITS2 Accuracy and Performance
 

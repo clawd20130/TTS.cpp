@@ -388,6 +388,32 @@ struct style_bert_vits2_runner : tts_generation_runner {
                                                            float length_scale,
                                                            float noise_scale,
                                                            std::vector<float> & decoder_z_nct);
+    bool synthesize_latent(const std::vector<float> & logw,
+                           const std::vector<float> & x_mask,
+                           const std::vector<float> & m_p,
+                           const std::vector<float> & logs_p,
+                           const std::vector<float> & noise,
+                           const std::vector<float> & g,
+                           uint32_t tokens,
+                           float length_scale,
+                           float noise_scale,
+                           tts_response & output,
+                           style_bert_vits2_alignment_result & alignment,
+                           std::string & error);
+    bool synthesize_front(const std::vector<int32_t> & phone_ids,
+                          const std::vector<int32_t> & tone_ids,
+                          const std::vector<int32_t> & language_ids,
+                          const std::vector<float> & bert,
+                          int32_t speaker_id,
+                          int32_t style_id,
+                          float style_weight,
+                          float sdp_ratio,
+                          float length_scale,
+                          float noise_scale,
+                          float noise_w_scale,
+                          tts_response & output,
+                          style_bert_vits2_alignment_result & alignment,
+                          std::string & error);
     ggml_cgraph * build_decoder_graph(uint32_t frames);
     void set_decoder_inputs(const float * decoder_z_nct, const float * decoder_g_nct, uint32_t frames);
     void decode(const float * decoder_z_nct, const float * decoder_g_nct, uint32_t frames, tts_response & output);

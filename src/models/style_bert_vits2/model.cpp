@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <format>
 #include <iostream>
 #include <string_view>
 
@@ -3528,6 +3529,162 @@ style_bert_vits2_alignment_result style_bert_vits2_runner::build_decoder_latent(
                   << std::endl;
     }
     return alignment;
+}
+
+bool style_bert_vits2_runner::synthesize_latent(const std::vector<float> & logw,
+                                                const std::vector<float> & x_mask,
+                                                const std::vector<float> & m_p,
+                                                const std::vector<float> & logs_p,
+                                                const std::vector<float> & noise,
+                                                const std::vector<float> & g,
+                                                uint32_t tokens,
+                                                float length_scale,
+                                                float noise_scale,
+                                                tts_response & output,
+                                                style_bert_vits2_alignment_result & alignment,
+                                                std::string & error) {
+    const size_t expected_tokens = tokens;
+    const size_t expected_text = (size_t) model->inter_channels * expected_tokens;
+    if (expected_tokens == 0 ||
+        logw.size() != expected_tokens ||
+        x_mask.size() != expected_tokens ||
+        m_p.size() != expected_text ||
+        logs_p.size() != expected_text ||
+        g.size() != model->gin_channels) {
+        error = std::format(
+            "Style-Bert latent input size mismatch: tokens={}, logw={}, x_mask={}, m_p={} expected_m_p={}, logs_p={} expected_logs_p={}, g={} expected_g={}.",
+            expected_tokens,
+            logw.size(),
+            x_mask.size(),
+            m_p.size(),
+            expected_text,
+            logs_p.size(),
+            expected_text,
+            g.size(),
+            model->gin_channels);
+        return false;
+    }
+
+    alignment = expand_alignment(logw.data(), x_mask.data(), m_p.data(), logs_p.data(), tokens, length_scale);
+    const size_t expected_noise = (size_t) model->inter_channels * alignment.frames;
+    if (noise.size() != expected_noise) {
+        error = std::format("Style-Bert latent noise size mismatch: got {}, expected {} for {} frames.",
+                            noise.size(),
+                            expected_noise,
+                            alignment.frames);
+        return false;
+    }
+
+    std::vector<float> decoder_z;
+    build_decoder_latent(logw.data(),
+                         x_mask.data(),
+                         m_p.data(),
+                         logs_p.data(),
+                         noise.data(),
+                         g.data(),
+                         tokens,
+                         length_scale,
+                         noise_scale,
+                         decoder_z);
+    decode(decoder_z.data(), g.data(), alignment.frames, output);
+    return output.n_outputs != 0;
+}
+
+bool style_bert_vits2_runner::synthesize_front(const std::vector<int32_t> & phone_ids,
+                                               const std::vector<int32_t> & tone_ids,
+                                               const std::vector<int32_t> & language_ids,
+                                               const std::vector<float> & bert,
+                                               int32_t speaker_id,
+                                               int32_t style_id,
+                                               float style_weight,
+                                               float sdp_ratio,
+                                               float length_scale,
+                                               float noise_scale,
+                                               float noise_w_scale,
+                                               tts_response & output,
+                                               style_bert_vits2_alignment_result & alignment,
+                                               std::string & error) {
+    const size_t tokens = phone_ids.size();
+    const size_t expected_bert = tokens * 1024;
+    if (tokens == 0 ||
+        tone_ids.size() != tokens ||
+        language_ids.size() != tokens ||
+        bert.size() != expected_bert) {
+        error = std::format(
+            "Style-Bert front input size mismatch: tokens={}, phone_ids={}, tone_ids={}, language_ids={}, bert={} expected_bert={}.",
+            tokens,
+            phone_ids.size(),
+            tone_ids.size(),
+            language_ids.size(),
+            bert.size(),
+            expected_bert);
+        return false;
+    }
+
+    std::vector<float> g;
+    std::vector<float> style_vec;
+    std::vector<float> x_mask(tokens, 1.0f);
+    std::vector<float> x;
+    std::vector<float> m_p;
+    std::vector<float> logs_p;
+    std::vector<float> logw;
+    encode_speaker(speaker_id, g);
+    encode_style_vector(style_id, style_weight, style_vec);
+    run_text_encoder(phone_ids.data(),
+                     tone_ids.data(),
+                     language_ids.data(),
+                     bert.data(),
+                     style_vec.data(),
+                     x_mask.data(),
+                     g.data(),
+                     (uint32_t) tokens,
+                     x,
+                     m_p,
+                     logs_p);
+
+    std::vector<float> logw_dp;
+    predict_duration(x.data(), x_mask.data(), g.data(), (uint32_t) tokens, logw_dp);
+    logw = logw_dp;
+    if (std::fabs(sdp_ratio) > 1e-6f) {
+        std::vector<float> sdp_condition;
+        run_stochastic_duration_condition(x.data(),
+                                          x_mask.data(),
+                                          g.data(),
+                                          (uint32_t) tokens,
+                                          sdp_condition);
+        std::vector<float> sdp_noise(tokens * 2);
+        random_normal_gen((int) sdp_noise.size(), sdp_noise.data());
+        for (float & value : sdp_noise) {
+            value *= noise_w_scale;
+        }
+        std::vector<float> logw_sdp;
+        run_stochastic_duration_reverse(sdp_noise.data(),
+                                        x_mask.data(),
+                                        sdp_condition.data(),
+                                        (uint32_t) tokens,
+                                        logw_sdp);
+        logw.resize(tokens);
+        for (size_t i = 0; i < tokens; ++i) {
+            logw[i] = logw_sdp[i] * sdp_ratio + logw_dp[i] * (1.0f - sdp_ratio);
+        }
+    }
+
+    alignment = expand_alignment(logw.data(), x_mask.data(), m_p.data(), logs_p.data(), (uint32_t) tokens, length_scale);
+    std::vector<float> noise((size_t) model->inter_channels * alignment.frames);
+    random_normal_gen((int) noise.size(), noise.data());
+    std::vector<float> decoder_z;
+    build_decoder_latent(logw.data(),
+                         x_mask.data(),
+                         m_p.data(),
+                         logs_p.data(),
+                         noise.data(),
+                         g.data(),
+                         (uint32_t) tokens,
+                         length_scale,
+                         noise_scale,
+                         decoder_z);
+    decode(decoder_z.data(), g.data(), alignment.frames, output);
+    return output.n_outputs != 0;
 }
 
 ggml_cgraph * style_bert_vits2_runner::build_decoder_graph(uint32_t frames) {
