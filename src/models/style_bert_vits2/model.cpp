@@ -66,6 +66,11 @@ static bool metal_fused_conv_transpose1d_enabled() {
     return env && env[0] ? std::strcmp(env, "0") != 0 : backend_is_metal;
 }
 
+static bool metal_fused_upsample_pre_relu_enabled() {
+    const char * env = std::getenv("STYLE_BERT_VITS2_METAL_FUSED_UPSAMPLE_PRE_RELU");
+    return env && env[0] && std::strcmp(env, "0") != 0;
+}
+
 static bool attention_legacy_enabled() {
     const char * env = std::getenv("STYLE_BERT_VITS2_ATTENTION_LEGACY");
     return env && env[0] && std::strcmp(env, "0") != 0;
@@ -1306,22 +1311,26 @@ static ggml_tensor * crop_time_padding(ggml_context * ctx, ggml_tensor * input, 
     return ggml_cont(ctx, view);
 }
 
-static ggml_tensor * conv_transpose1d(ggml_context * ctx, const style_bert_vits2_upsample & up, ggml_tensor * input) {
+static ggml_tensor * conv_transpose1d(ggml_context * ctx, const style_bert_vits2_upsample & up, ggml_tensor * input, float pre_relu_slope = -1.0f) {
     TTS_ASSERT(up.weight);
     TTS_ASSERT(input);
     if (up.bias && metal_fused_conv_transpose1d_enabled()) {
-        return ggml_style_bert_vits2_conv_transpose_1d(ctx,
-                                                       up.weight,
-                                                       input,
-                                                       up.bias,
-                                                       (int) up.stride,
-                                                       0,
-                                                       1,
-                                                       0,
-                                                       1,
-                                                       (int) up.padding);
+        return ggml_style_bert_vits2_conv_transpose_1d_ex(ctx,
+                                                          up.weight,
+                                                          input,
+                                                          up.bias,
+                                                          (int) up.stride,
+                                                          0,
+                                                          1,
+                                                          0,
+                                                          1,
+                                                          (int) up.padding,
+                                                          pre_relu_slope);
     }
-    ggml_tensor * cur = tts_conv_transpose_1d(ctx, up.weight, input, (int) up.stride, 0, 1, 0, 1);
+    ggml_tensor * conv_input = pre_relu_slope >= 0.0f
+        ? ggml_leaky_relu(ctx, input, pre_relu_slope, false)
+        : input;
+    ggml_tensor * cur = tts_conv_transpose_1d(ctx, up.weight, conv_input, (int) up.stride, 0, 1, 0, 1);
     cur = crop_time_padding(ctx, cur, up.padding);
     if (up.bias) {
         cur = ggml_add(ctx, cur, up.bias);
@@ -1367,13 +1376,22 @@ static ggml_tensor * build_decoder(
     }
 
     for (uint32_t i = 0; i < model->num_upsamples; ++i) {
-        cur = ggml_leaky_relu(ctx, cur, 0.1f, false);
-        ggml_format_name(cur, "style_bert_vits2.up.%u.pre_relu", i);
-        if (debug_node_matches(cur, debug_stop_node)) {
-            *debug_stop_found = true;
-            return cur;
+        char pre_relu_name[64];
+        std::snprintf(pre_relu_name, sizeof(pre_relu_name), "style_bert_vits2.up.%u.pre_relu", i);
+        const bool fuse_pre_relu = metal_fused_conv_transpose1d_enabled() && metal_fused_upsample_pre_relu_enabled();
+        const bool needs_pre_relu_node = !fuse_pre_relu ||
+            (debug_stop_node && std::strcmp(debug_stop_node, pre_relu_name) == 0);
+        if (!needs_pre_relu_node) {
+            cur = conv_transpose1d(ctx, model->decoder.ups[i], cur, 0.1f);
+        } else {
+            cur = ggml_leaky_relu(ctx, cur, 0.1f, false);
+            ggml_set_name(cur, pre_relu_name);
+            if (debug_node_matches(cur, debug_stop_node)) {
+                *debug_stop_found = true;
+                return cur;
+            }
+            cur = conv_transpose1d(ctx, model->decoder.ups[i], cur);
         }
-        cur = conv_transpose1d(ctx, model->decoder.ups[i], cur);
         ggml_format_name(cur, "style_bert_vits2.up.%u.conv_transpose", i);
         if (debug_node_matches(cur, debug_stop_node)) {
             *debug_stop_found = true;
