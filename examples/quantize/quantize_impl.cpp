@@ -17,6 +17,10 @@ static bool kokoro_is_f16_compatible(std::string_view name) {
            name.find("alpha") == std::string::npos && !name.ends_with("embd") && !name.ends_with("norm");
 }
 
+static bool is_gguf_internal_tensor(std::string_view name) {
+    return name == "GGUF tensor data binary blob";
+}
+
 static bool kokoro_is_quantizable(const std::string & name, const quantization_params & params) {
     // A list of all of the top level GGUF names under kokoro.duration_predictor that have quantization compatible tensors.
     static constexpr std::array<std::string_view, 5> DURATION_PREDICTOR_QUANTIZATION_COMPATIBLE_PARTS = {
@@ -48,11 +52,136 @@ static bool dia_is_quantizable(std::string_view name, const quantization_params 
     return quantizable;
 }
 
+static bool parler_quantize_scope_is_default(std::string_view scope) {
+    return scope.empty() || scope == "default" || scope == "legacy";
+}
+
+static bool parler_quantize_scope_contains(std::string_view scopes, std::string_view target) {
+    if (scopes == "all") {
+        return true;
+    }
+    size_t begin = 0;
+    while (begin <= scopes.size()) {
+        const size_t comma = scopes.find(',', begin);
+        const size_t end   = comma == std::string_view::npos ? scopes.size() : comma;
+        while (begin < end && scopes[begin] == ' ') {
+            begin++;
+        }
+        size_t trimmed_end = end;
+        while (trimmed_end > begin && scopes[trimmed_end - 1] == ' ') {
+            trimmed_end--;
+        }
+        if (scopes.substr(begin, trimmed_end - begin) == target) {
+            return true;
+        }
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        begin = comma + 1;
+    }
+    return false;
+}
+
+static bool parler_is_base_quantizable(std::string_view name) {
+    return !name.starts_with("audio_encoder") && !name.ends_with("norm.weight") &&
+           !name.ends_with("text_encoding") && !name.ends_with("positional_embed") &&
+           !name.ends_with("norm.bias");
+}
+
+static bool parler_is_scope_quantizable(std::string_view name, const quantization_params & params) {
+    if (!parler_is_base_quantizable(name)) {
+        return false;
+    }
+
+    const std::string_view scopes = params.parler_quantize_scope;
+    if (parler_quantize_scope_contains(scopes, "all")) {
+        return true;
+    }
+    if (parler_quantize_scope_contains(scopes, "mlp")) {
+        if (name.ends_with(".fc1.weight") || name.ends_with(".fc2.weight")) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scopes, "attention")) {
+        if (name.find(".self_attn.") != std::string_view::npos ||
+            name.find(".encoder_attn.") != std::string_view::npos) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scopes, "self_attn")) {
+        if (name.find(".self_attn.") != std::string_view::npos) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scopes, "self_attn_q")) {
+        if (name.ends_with(".self_attn.q_proj.weight")) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scopes, "self_attn_k")) {
+        if (name.ends_with(".self_attn.k_proj.weight")) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scopes, "self_attn_v")) {
+        if (name.ends_with(".self_attn.v_proj.weight")) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scopes, "self_attn_out")) {
+        if (name.ends_with(".self_attn.out_proj.weight")) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scopes, "encoder_attn")) {
+        if (name.find(".encoder_attn.") != std::string_view::npos) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scopes, "encoder_attn_q")) {
+        if (name.ends_with(".encoder_attn.q_proj.weight")) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scopes, "encoder_attn_k")) {
+        if (name.ends_with(".encoder_attn.k_proj.weight")) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scopes, "encoder_attn_v")) {
+        if (name.ends_with(".encoder_attn.v_proj.weight")) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scopes, "encoder_attn_out")) {
+        if (name.ends_with(".encoder_attn.out_proj.weight")) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scopes, "encoder_attn_kv")) {
+        if (name.ends_with(".encoder_attn.k_proj.weight") || name.ends_with(".encoder_attn.v_proj.weight")) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scopes, "output_heads")) {
+        if (name.ends_with("weight.head")) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scopes, "text_embeddings")) {
+        if (name.ends_with("embed_prompts")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool parler_is_quanitizable(std::string_view name, const quantization_params & params) {
     // the DAC audio encoder / decoder is not compatible with quantization, normalization weight shouldn't be quantized, and the text encoding shouldn't be normalized.
-    bool quantizable = !name.starts_with("audio_encoder") && !name.ends_with("norm.weight") &&
-                       !name.ends_with("text_encoding") && !name.ends_with("positional_embed") &&
-                       !name.ends_with("norm.bias");
+    if (!parler_quantize_scope_is_default(params.parler_quantize_scope)) {
+        return parler_is_scope_quantizable(name, params);
+    }
+    bool quantizable = parler_is_base_quantizable(name);
     if (!params.quantize_output_heads) {
         quantizable = quantizable && !name.ends_with("weight.head");
     }
@@ -83,16 +212,6 @@ static size_t quantize_tensor(void * new_data, const ggml_tensor * tensor, const
                               uint32_t n_threads) {
     // much of this is form copied from llama.cpp
     int chunk_size_multiplier = 1;
-    if (qtype == GGML_TYPE_Q4_0_4_4 || qtype == GGML_TYPE_Q4_0_4_8 || qtype == GGML_TYPE_Q4_0_8_8) {
-        if ((qtype == GGML_TYPE_Q4_0_8_8) && (tensor->ne[1] % 8 != 0) || tensor->ne[1] % 4 != 0) {
-            qtype = GGML_TYPE_Q4_0;
-        }
-        if (qtype == GGML_TYPE_Q4_0_8_8) {
-            chunk_size_multiplier = 8;
-        } else if (qtype == GGML_TYPE_Q4_0_4_4 || qtype == GGML_TYPE_Q4_0_4_8) {
-            chunk_size_multiplier = 4;
-        }
-    }
     size_t                   out_size       = 0;
     const int32_t            d3_step        = tensor->ne[0] * tensor->ne[1];
     const int32_t            n_per_row      = tensor->ne[0];
@@ -193,7 +312,8 @@ void quantize_gguf(const char * ifile, const char * ofile, const quantization_pa
     tts_arch arch_type = SUPPORTED_ARCHITECTURES.at(arch);
 
     if (params.quantize_type != GGML_TYPE_Q5_0 && params.quantize_type != GGML_TYPE_Q8_0 &&
-        params.quantize_type != GGML_TYPE_F16 && params.quantize_type != GGML_TYPE_Q4_0) {
+        params.quantize_type != GGML_TYPE_F16 && params.quantize_type != GGML_TYPE_BF16 &&
+        params.quantize_type != GGML_TYPE_Q4_0) {
         fprintf(stdout, "Warning, %s is untested for quantization type '%d'. Use at your own risk.\n", arch.c_str(),
                 params.quantize_type);
     }
@@ -206,7 +326,7 @@ void quantize_gguf(const char * ifile, const char * ofile, const quantization_pa
     gguf_set_val_u32(ctx_out.get(), "general.quantization_type", params.quantize_type);
     for (ggml_tensor * tensor = ggml_get_first_tensor(weight_ctx); tensor;
          tensor               = ggml_get_next_tensor(weight_ctx, tensor)) {
-        if (*ggml_get_name(tensor)) {
+        if (*ggml_get_name(tensor) && !is_gguf_internal_tensor(ggml_get_name(tensor))) {
             gguf_add_tensor(ctx_out.get(), tensor);
         }
     }
@@ -240,17 +360,11 @@ void quantize_gguf(const char * ifile, const char * ofile, const quantization_pa
         const char * const     name = ggml_get_name(cur);
         const std::string_view name_sv{ name };
 
-        if (!*name) {
+        if (!*name || is_gguf_internal_tensor(name)) {
             continue;
         }
 
-        if (is_quantizable(arch_type, name, params)) {
-            if ((cur->type) != GGML_TYPE_F32) {
-                GGML_ABORT(
-                    "ERROR: All quantized tensors must be transformed from 32bit floats. Tensor, '%s', has improper "
-                    "type, '%d'\n",
-                    cur->name, cur->type);
-            }
+        if (is_quantizable(arch_type, name, params) && cur->type == GGML_TYPE_F32) {
             new_type = params.quantize_type;
             if ((new_type >= GGML_TYPE_IQ2_XXS && new_type <= GGML_TYPE_IQ4_XS)) {
                 GGML_ABORT("ERROR: Quantization type '%d' requires an importance matrix.\n", new_type);
@@ -261,15 +375,10 @@ void quantize_gguf(const char * ifile, const char * ofile, const quantization_pa
             }
             new_data = work.data();
             new_size = quantize_tensor(new_data, cur, nullptr, new_type, params.n_threads);
-        } else if ((params.convert_non_quantizable_to_f16 && kokoro_is_f16_compatible(name)) ||
-                   (params.convert_dac_to_f16 && name_sv.starts_with("audio_encoder") && !name_sv.ends_with("alpha"))) {
-            if ((cur->type) != GGML_TYPE_F32) {
-                GGML_ABORT(
-                    "ERROR: All converted tensors must be transformed from 32bit floats. Tensor, '%s', has improper "
-                    "type, '%d'\n",
-                    cur->name, cur->type);
-            }
-            new_type                    = GGML_TYPE_F16;
+        } else if (((params.convert_non_quantizable_to_f16 && kokoro_is_f16_compatible(name)) ||
+                    (params.convert_dac_to_f16 && name_sv.starts_with("audio_encoder") && !name_sv.ends_with("alpha"))) &&
+                   cur->type == GGML_TYPE_F32) {
+            new_type = GGML_TYPE_F16;
             const int64_t nelement_size = ggml_nelements(cur) * 4;
             if (work.size() < static_cast<size_t>(nelement_size)) {
                 work.resize(nelement_size);  // upper bound on size
@@ -283,7 +392,7 @@ void quantize_gguf(const char * ifile, const char * ofile, const quantization_pa
         }
 
         gguf_set_tensor_type(ctx_out.get(), name, new_type);
-        gguf_set_tensor_data(ctx_out.get(), name, new_data, new_size);
+        gguf_set_tensor_data(ctx_out.get(), name, new_data);
         fprintf(stdout, "At tensor: '%s' with new size: %zu bytes\n", name, new_size);
         // write tensor data + padding
         fout.write(static_cast<const char *>(new_data), new_size);

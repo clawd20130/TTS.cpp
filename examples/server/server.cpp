@@ -1263,6 +1263,9 @@ int main(int argc, const char ** argv) {
         if (data.contains("input_phonemes") && data.at("input_phonemes").is_boolean()) {
             conf.input_phonemes = data.at("input_phonemes").get<bool>();
         }
+        if (data.contains("sample") && data.at("sample").is_boolean()) {
+            conf.sample = data.at("sample").get<bool>();
+        }
         task->return_alignment = json_value(data, "return_alignment", false);
 
         if (data.contains("model") && data.at("model").is_string()) {

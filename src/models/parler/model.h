@@ -42,6 +42,7 @@ struct parler_layer {
     struct ggml_tensor * self_attn_k_proj;
     struct ggml_tensor * self_attn_q_proj;
     struct ggml_tensor * self_attn_v_proj;
+    struct ggml_tensor * self_attn_qkv_proj = nullptr;
     struct ggml_tensor * self_attn_o_proj;
     struct ggml_tensor * self_attn_norm;
     struct ggml_tensor * self_attn_norm_bias;
@@ -55,6 +56,7 @@ struct parler_layer {
     
     struct ggml_tensor * cross_k;
     struct ggml_tensor * cross_v;
+    struct ggml_tensor * cross_v_flash = nullptr;
     
     struct ggml_tensor * fc1;
     struct ggml_tensor * fc2;
@@ -85,6 +87,9 @@ struct parler_tts_model : tts_model {
     std::vector<struct ggml_tensor*> embds;
     std::vector<parler_layer*> layers;
     std::vector<struct ggml_tensor*> heads;
+    struct ggml_tensor * fused_heads = nullptr;
+    struct ggml_context * fused_qkv_ctx = nullptr;
+    ggml_backend_buffer_t fused_qkv_buf = nullptr;
     
     struct ggml_tensor * precomputed_input_emb;
     struct ggml_tensor * precomputed_positional_embds;
@@ -97,10 +102,18 @@ struct parler_tts_model : tts_model {
     void prep_constants(gguf_context * meta);
     void prep_layers(gguf_context * meta);
     void prep_cross_key_values(int n_threads, struct tts_response * conditional_prompt = nullptr);
+    void prep_fused_heads();
+    void prep_fused_self_attn_qkv();
+    void free_fused_self_attn_qkv();
+    ~parler_tts_model() {
+        free_fused_self_attn_qkv();
+    }
     void setup_from_file(gguf_context * meta_ctx, ggml_context * load_context, bool cpu_only) {
         prep_constants(meta_ctx);
         prep_layers(meta_ctx);
-        tts_model::setup_from_file(meta_ctx, load_context, cpu_only, "decoder", 1.30, max_encode_length*hidden_size*sizeof(float)*n_layers*2);
+        const uint32_t cross_attn_bytes = max_encode_length*hidden_size*sizeof(float)*n_layers*3;
+        const uint32_t fused_head_bytes = n_output_heads*output_vocab_size*hidden_size*sizeof(float);
+        tts_model::setup_from_file(meta_ctx, load_context, cpu_only, "decoder", 1.32, cross_attn_bytes + fused_head_bytes);
     }
 };
 
@@ -120,17 +133,29 @@ struct parler_context : runner_context {
     uint32_t current_position = 0; // current position in the active sequence
     uint32_t prompt_end_position = 0; // the position of the text prompt termination (used for adjusting the cache when incrementally generating)
     uint32_t first_codebook_unfinished = 0;
+    uint32_t profiled_decode_steps = 0;
+    uint32_t last_decode_frames = 0;
 
     std::vector<uint32_t> output_tokens;
     
     struct ggml_tensor * inp_tokens;
     struct ggml_tensor * audio_inp_tokens;
+    std::vector<struct ggml_tensor *> audio_inp_tokens_by_head;
+    std::vector<std::vector<uint32_t>> audio_inp_token_scratch;
     struct ggml_tensor * positions;
     struct ggml_tensor * attn_mask;
     struct ggml_tensor * attn_mask_cross;
+    struct ggml_tensor * logits_mask = nullptr;
+    bool last_decode_used_gpu_argmax = false;
+    std::vector<float> logits_mask_scratch;
+    std::vector<int32_t> argmax_tokens_scratch;
+    std::vector<struct ggml_tensor *> unroll_token_inputs;
+    std::vector<int32_t> unroll_token_values;
+    std::vector<struct ggml_tensor *> unroll_position_inputs;
+    std::vector<int32_t> unroll_position_values;
     
-    void build_schedule() {
-        runner_context::build_schedule(model->max_nodes());
+    void build_schedule(size_t max_nodes = 0) {
+        runner_context::build_schedule(max_nodes > 0 ? max_nodes : model->max_nodes());
     }
     void reset(int32_t n_output_heads);
 };
@@ -141,6 +166,7 @@ struct parler_kv_cache {
 
     std::vector<struct ggml_tensor *> k_l;
     std::vector<struct ggml_tensor *> v_l;
+    std::vector<struct ggml_tensor *> v_flash_l;
     
     struct ggml_context * ctx;
     ggml_backend_buffer_type_t buft;
@@ -213,7 +239,11 @@ struct parler_tts_runner : tts_generation_runner {
     parler_ubatch build_worst_case_batch();
     struct ggml_cgraph * build_parler_graph(parler_ubatch & batch);
     void set_inputs(parler_ubatch & batch);
-    int decode(parler_ubatch & batch);
+    struct decode_timing;
+    int decode(parler_ubatch & batch, decode_timing * timing = nullptr);
+    int decode_unrolled(parler_ubatch & batch, uint32_t unroll_steps, decode_timing * timing = nullptr);
+    bool can_use_gpu_argmax(const parler_ubatch & batch) const;
+    uint32_t decoder_unroll_steps(const parler_ubatch & batch) const;
     void prepare_post_load() override;
     void generate(const char * sentence, tts_response & output, const generation_configuration & config) override;
     bool check_stopping();

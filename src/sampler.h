@@ -27,6 +27,7 @@ struct sampler {
     void max(float * logits, std::vector<uint32_t> & output_tokens);
     std::vector<std::vector<size_t>> topk(float * logits, bool performed_softmax);
     void topp(float * logits, std::vector<std::vector<size_t>> & picks, std::vector<float> & max_head_probs);
+    bool can_use_argmax_fast_path() const;
     void reset();
 };
 

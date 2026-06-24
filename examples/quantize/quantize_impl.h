@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 #include "ggml.h"
 
 struct quantization_params {
@@ -10,6 +12,7 @@ struct quantization_params {
     bool quantize_cross_attn_kv;
     bool convert_dac_to_f16;
     bool convert_non_quantizable_to_f16;
+    std::string parler_quantize_scope;
 };
 
 void quantize_gguf(const char * ifile, const char * ofile, const quantization_params & params);

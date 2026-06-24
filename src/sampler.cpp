@@ -107,6 +107,10 @@ void sampler::sample(float * logits, std::vector<uint32_t> & output_tokens) {
     }
 }
 
+bool sampler::can_use_argmax_fast_path() const {
+    return !do_sample && repetition_penalty == 1.0f;
+}
+
 void sampler::reset() {
     if (repetition_penalty != 1.0) {
         last_token_ids.clear();

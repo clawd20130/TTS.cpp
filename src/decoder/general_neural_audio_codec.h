@@ -48,6 +48,7 @@ namespace general_neural_audio_codec {
         }
         struct ggml_tensor * in_alpha;
         struct ggml_tensor * in_conv_kernel;
+        struct ggml_tensor * in_conv_kernel_cols = nullptr;
         struct ggml_tensor * in_conv_bias;
         struct ggml_tensor * noise_conv_kernel = nullptr;
 
@@ -60,6 +61,7 @@ namespace general_neural_audio_codec {
     void assign_to_residual_unit(tts_model * model, residual_unit & unit, std::string name, struct ggml_tensor * tensor);
     void assign_to_layer(tts_model * model, layer & l, std::string name, struct ggml_tensor * tensor);
     void assign_to_quantize_layer(tts_model * model, residual_vector_quantize_layer & l, std::string name, struct ggml_tensor * tensor);
+    bool use_col2im_transpose_1d();
 
     struct ggml_tensor * build_residual_unit(ggml_context * ctx, struct ggml_tensor * cur, residual_unit & unit);
     struct ggml_tensor * build_layer(ggml_context * ctx, struct ggml_tensor * cur, layer & l, struct ggml_tensor * noise = nullptr);

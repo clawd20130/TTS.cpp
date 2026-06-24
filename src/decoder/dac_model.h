@@ -41,11 +41,7 @@ struct dac_model : tts_model {
     void assign_weight(std::string name, ggml_tensor * weight);
     void prep_constants(gguf_context * meta);
     void prep_layers(gguf_context * meta);
-    void setup_from_file(gguf_context * meta_ctx, ggml_context * load_context, bool cpu_only) {
-        prep_layers(meta_ctx);
-        prep_constants(meta_ctx);
-        tts_model::setup_from_file(meta_ctx, load_context, cpu_only, "audio_encoder");
-    }
+    void setup_from_file(gguf_context * meta_ctx, ggml_context * load_context, bool cpu_only);
 };
 
 // for loading DAC model from gguf file

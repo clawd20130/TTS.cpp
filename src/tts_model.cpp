@@ -257,18 +257,22 @@ void append_to_response(tts_response & response, tts_response & to_append) {
  * Pulls output_size to prepped buffer 'output' from 'output_node' tensor. If no buffer is passed will default to the existing output buffer present
  * on runner_context.
  */
-void runner_context::get_ggml_node_data(struct ggml_tensor * output_node, float * output, size_t output_size, ggml_backend_buffer_t buffer) {
+void runner_context::get_ggml_node_data_raw(struct ggml_tensor * output_node, void * output, size_t output_size, ggml_backend_buffer_t buffer) {
     if (buffer == nullptr) {
         buffer = buf_output;
     }
     if (ggml_backend_buffer_get_size(buffer) < output_size) {
-        TTS_ABORT("Output buffer overflow of %d / %d for output node '%s'\n", output_size, ggml_backend_buffer_get_size(buffer), ggml_get_name(output_node));
+        TTS_ABORT("Output buffer overflow of %zu / %zu for output node '%s'\n", output_size, ggml_backend_buffer_get_size(buffer), ggml_get_name(output_node));
     } else if (ggml_nbytes(output_node) < output_size) {
-        TTS_ABORT("Output node, '%s', with %d bytes is too small for #ggml_backend_tensor_get_async with size of %d.\n", ggml_get_name(output_node), ggml_nbytes(output_node), output_size);
+        TTS_ABORT("Output node, '%s', with %zu bytes is too small for #ggml_backend_tensor_get_async with size of %zu.\n", ggml_get_name(output_node), ggml_nbytes(output_node), output_size);
     }
     ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched, output_node);
     ggml_backend_tensor_get_async(backend_res, output_node, output, 0, output_size);
     ggml_backend_synchronize(backend_res);
+}
+
+void runner_context::get_ggml_node_data(struct ggml_tensor * output_node, float * output, size_t output_size, ggml_backend_buffer_t buffer) {
+    get_ggml_node_data_raw(output_node, output, output_size, buffer);
 }
 
 void runner_context::set_threads() {
@@ -400,6 +404,27 @@ void tts_model::set_tensor(struct ggml_tensor * tensor, struct ggml_tensor * tar
     }
     ggml_backend_tensor_set(tensor, target->data, 0, size);
     ggml_set_name(tensor, target->name);
+    offset += size;
+}
+
+void tts_model::set_tensor_from_data(struct ggml_tensor * tensor, const void * data, size_t size, const char * name) {
+    const size_t alignment = ggml_backend_buffer_get_alignment(buf);
+    offset = tts_pad_to_alignment(offset, alignment);
+    tensor->buffer = buf;
+    tensor->data = (void *)((uint8_t *) ggml_backend_buffer_get_base(buf) + offset);
+    const size_t expected_size = ggml_nbytes(tensor);
+    if (size != expected_size) {
+        TTS_ABORT("Model tensor raw data size mismatch while loading '%s': %zu != %zu\n",
+                  name ? name : "<unnamed>", size, expected_size);
+    }
+    if (offset + size > ggml_backend_buffer_get_size(buf)) {
+        TTS_ABORT("Model tensor buffer overflow while loading '%s': %zu + %zu > %zu\n",
+                  name ? name : "<unnamed>", offset, size, ggml_backend_buffer_get_size(buf));
+    }
+    ggml_backend_tensor_set(tensor, data, 0, size);
+    if (name) {
+        ggml_set_name(tensor, name);
+    }
     offset += size;
 }
 

@@ -45,6 +45,7 @@ struct runner_context {
     float * logits = nullptr;
     int n_threads;
 
+    void get_ggml_node_data_raw(struct ggml_tensor * output_tensor, void * output, size_t output_size, ggml_backend_buffer_t buffer = nullptr);
     void get_ggml_node_data(struct ggml_tensor * output_tensor, float * output, size_t output_size, ggml_backend_buffer_t buffer = nullptr);
     void set_threads();
     void build_schedule(size_t max_nodes);
@@ -75,6 +76,7 @@ struct tts_model {
     void prep_buffers_and_context(bool cpu_only, float size_offset, uint32_t dedicated_add_on_size);
     void setup_from_file(gguf_context * meta_ctx, ggml_context * load_context, bool cpu_only, std::string model_prefix, float size_offset = 1.4, uint32_t dedicated_add_on_size = 0);
     void set_tensor(struct ggml_tensor * tensor, struct ggml_tensor * target);
+    void set_tensor_from_data(struct ggml_tensor * tensor, const void * data, size_t size, const char * name);
     void set_tensor_from_backend_tensor(struct ggml_tensor * tensor, struct ggml_tensor * target);
     size_t max_nodes();
     void assign_weight(std::string name, ggml_tensor * tensor);

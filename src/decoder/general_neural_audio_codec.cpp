@@ -1,10 +1,47 @@
 #include "general_neural_audio_codec.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace general_neural_audio_codec {
+    static bool env_truthy(const char * env) {
+        return env && env[0] && std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0;
+    }
+
+    bool use_col2im_transpose_1d() {
+        return env_truthy(std::getenv("TTS_CONV_TRANSPOSE_1D_COL2IM"));
+    }
+
+    static ggml_tensor * build_transpose_conv_kernel_cols(tts_model * model, ggml_tensor * tensor) {
+        const int64_t kernel_width = tensor->ne[0];
+        const int64_t out_channels = tensor->ne[1];
+        const int64_t in_channels = tensor->ne[2];
+        const size_t type_size = ggml_type_size(tensor->type);
+        const size_t size = (size_t) kernel_width * (size_t) out_channels * (size_t) in_channels * type_size;
+        std::vector<uint8_t> data(size);
+        const uint8_t * src = static_cast<const uint8_t *>(tensor->data);
+        for (int64_t ci = 0; ci < in_channels; ++ci) {
+            for (int64_t oc = 0; oc < out_channels; ++oc) {
+                for (int64_t k = 0; k < kernel_width; ++k) {
+                    const size_t src_index = (size_t) k + (size_t) oc * (size_t) kernel_width
+                        + (size_t) ci * (size_t) kernel_width * (size_t) out_channels;
+                    const size_t dst_index = (size_t) ci + ((size_t) oc * (size_t) kernel_width + (size_t) k) * (size_t) in_channels;
+                    std::memcpy(data.data() + dst_index * type_size, src + src_index * type_size, type_size);
+                }
+            }
+        }
+
+        ggml_tensor * cols = ggml_new_tensor_2d(model->ctx, tensor->type, in_channels, kernel_width * out_channels);
+        const std::string name = std::string(tensor->name) + ".cols";
+        model->set_tensor_from_data(cols, data.data(), data.size(), name.c_str());
+        return cols;
+    }
+
     // This contains a mapping between string names and gguf_tensor enum values for the purposes of assigning the weights from a gguf file
     // to the general_neural_audio_codec::layer.
     // Please note that some gguf_tensor values have multiple keys; this is to support backwards compatibility with original DAC settings.
@@ -80,6 +117,9 @@ namespace general_neural_audio_codec {
                 case LAYER_INPUT_KERNEL:
                     l.in_conv_kernel = ggml_dup_tensor(model->ctx, tensor);
                     model->set_tensor(l.in_conv_kernel, tensor);
+                    if (use_col2im_transpose_1d()) {
+                        l.in_conv_kernel_cols = build_transpose_conv_kernel_cols(model, tensor);
+                    }
                     break;
                 case LAYER_INPUT_BIAS:
                     l.in_conv_bias = ggml_dup_tensor(model->ctx, ggml_transpose(model->ctx, tensor));
@@ -150,7 +190,24 @@ namespace general_neural_audio_codec {
 
     struct ggml_tensor * build_layer(ggml_context * ctx, struct ggml_tensor * cur, layer & l, struct ggml_tensor * noise) {
         cur = snake_1d(ctx, l.in_alpha, cur);
-        cur = tts_conv_transpose_1d(ctx, l.in_conv_kernel, cur, l.stride, l.padding, 1, 0, 1);
+        if (use_col2im_transpose_1d()) {
+            const int64_t kernel_width = l.in_conv_kernel->ne[0];
+            const int64_t out_channels = l.in_conv_kernel->ne[1];
+            const int64_t in_channels = l.in_conv_kernel->ne[2];
+            struct ggml_tensor * kernel_cols = l.in_conv_kernel_cols;
+            if (!kernel_cols) {
+                kernel_cols = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, l.in_conv_kernel, kernel_width * out_channels, in_channels)));
+                ggml_set_name(kernel_cols, "gnac.transpose_conv.kernel_cols");
+            }
+            struct ggml_tensor * cur_channels_time = ggml_cont(ctx, ggml_transpose(ctx, cur));
+            ggml_set_name(cur_channels_time, "gnac.transpose_conv.input_channels_time");
+            cur = ggml_mul_mat(ctx, kernel_cols, cur_channels_time);
+            ggml_set_name(cur, "gnac.transpose_conv.columns");
+            cur = ggml_col2im_1d(ctx, cur, l.stride, (int) out_channels, l.padding);
+            ggml_set_name(cur, "gnac.transpose_conv.col2im");
+        } else {
+            cur = tts_conv_transpose_1d(ctx, l.in_conv_kernel, cur, l.stride, l.padding, 1, 0, 1);
+        }
         cur = ggml_add(ctx, cur, l.in_conv_bias);
         if (l.noise_conv_kernel && noise) {
             struct ggml_tensor * x = ggml_conv_1d(ctx, l.noise_conv_kernel, cur, 1, 0, 1);
