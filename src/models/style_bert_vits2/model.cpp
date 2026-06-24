@@ -59,6 +59,13 @@ static uint32_t metal_tiled_conv1d_min_output() {
     return (uint32_t) parsed;
 }
 
+static bool metal_fused_conv_transpose1d_enabled() {
+    const char * backend = std::getenv("TTS_BACKEND");
+    const bool backend_is_metal = backend && std::strcmp(backend, "metal") == 0;
+    const char * env = std::getenv("STYLE_BERT_VITS2_METAL_FUSED_CONV_TRANSPOSE_1D");
+    return env && env[0] ? std::strcmp(env, "0") != 0 : backend_is_metal;
+}
+
 static bool attention_legacy_enabled() {
     const char * env = std::getenv("STYLE_BERT_VITS2_ATTENTION_LEGACY");
     return env && env[0] && std::strcmp(env, "0") != 0;
@@ -1302,6 +1309,18 @@ static ggml_tensor * crop_time_padding(ggml_context * ctx, ggml_tensor * input, 
 static ggml_tensor * conv_transpose1d(ggml_context * ctx, const style_bert_vits2_upsample & up, ggml_tensor * input) {
     TTS_ASSERT(up.weight);
     TTS_ASSERT(input);
+    if (up.bias && metal_fused_conv_transpose1d_enabled()) {
+        return ggml_style_bert_vits2_conv_transpose_1d(ctx,
+                                                       up.weight,
+                                                       input,
+                                                       up.bias,
+                                                       (int) up.stride,
+                                                       0,
+                                                       1,
+                                                       0,
+                                                       1,
+                                                       (int) up.padding);
+    }
     ggml_tensor * cur = tts_conv_transpose_1d(ctx, up.weight, input, (int) up.stride, 0, 1, 0, 1);
     cur = crop_time_padding(ctx, cur, up.padding);
     if (up.bias) {
