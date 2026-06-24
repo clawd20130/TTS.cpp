@@ -15,6 +15,7 @@ add_library(tts
         util.cpp
         util.h
         args.cpp
+        ../ggml-patches/llama-mmap.cpp
         style_bert_vits2_c_api.cpp
         tts_model.cpp
         tts_model.h
