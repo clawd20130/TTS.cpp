@@ -49,6 +49,21 @@ TTS_API int tts_style_bert_vits2_synthesize_front(tts_style_bert_vits2_handle * 
                                                   float noise_scale,
                                                   float noise_w_scale,
                                                   tts_style_bert_vits2_float_buffer * out_audio);
+TTS_API int tts_style_bert_vits2_synthesize_front_with_style_vec(tts_style_bert_vits2_handle * handle,
+                                                                 const int32_t * phone_ids,
+                                                                 const int32_t * tone_ids,
+                                                                 const int32_t * language_ids,
+                                                                 size_t tokens,
+                                                                 const float * bert,
+                                                                 size_t bert_length,
+                                                                 const float * style_vec,
+                                                                 size_t style_vec_length,
+                                                                 int32_t speaker_id,
+                                                                 float sdp_ratio,
+                                                                 float length_scale,
+                                                                 float noise_scale,
+                                                                 float noise_w_scale,
+                                                                 tts_style_bert_vits2_float_buffer * out_audio);
 
 TTS_API int tts_style_bert_vits2_jp_bert_load_model(const char * model_path,
                                                     int n_threads,

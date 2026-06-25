@@ -41,6 +41,11 @@ static bool debug_load_enabled() {
     return env && env[0] && std::strcmp(env, "0") != 0;
 }
 
+static bool debug_alignment_enabled() {
+    const char * env = std::getenv("STYLE_BERT_VITS2_DEBUG_ALIGNMENT");
+    return env && env[0] && std::strcmp(env, "0") != 0;
+}
+
 static bool flow_fused_enabled() {
     const char * env = std::getenv("STYLE_BERT_VITS2_FLOW_FUSED");
     return env && env[0] && std::strcmp(env, "0") != 0;
@@ -64,6 +69,14 @@ static uint32_t metal_tiled_conv1d_min_output() {
         return 1;
     }
     return (uint32_t) parsed;
+}
+
+static float style_bert_vits2_duration_ceil(float w) {
+    // Keep ONNX parity at integer duration boundaries. Tiny ggml/backend drift such as
+    // 2.00005 should not expand to one full extra decoder frame.
+    constexpr float k_ceil_epsilon = 1e-4f;
+    const float adjusted = w > 1.0f ? std::max(0.0f, w - k_ceil_epsilon) : w;
+    return std::ceil(adjusted);
 }
 
 static bool metal_fused_conv_transpose1d_enabled() {
@@ -304,9 +317,9 @@ static ggml_tensor * conv1d(
                                      (int) conv.dilation,
                                      -1.0f);
     } else {
-        cur = use_tiled
-            ? ggml_kokoro_conv_1d(ctx, conv.weight, conv_input, 1, (int) conv.padding, (int) conv.dilation)
-            : ggml_conv_1d(ctx, conv.weight, conv_input, 1, (int) conv.padding, (int) conv.dilation);
+        // ggml_conv_1d lowers through F16 im2col; keep Style-Bert-VITS2 convs on
+        // the F32 direct path so duration boundaries stay aligned with ONNX.
+        cur = ggml_kokoro_conv_1d(ctx, conv.weight, conv_input, 1, (int) conv.padding, (int) conv.dilation);
     }
     if (conv.bias && !fuse_bias_only) {
         cur = ggml_add(ctx, cur, conv.bias);
@@ -3242,7 +3255,7 @@ style_bert_vits2_alignment_result style_bert_vits2_runner::expand_alignment(cons
     for (uint32_t t = 0; t < tokens; ++t) {
         const float mask = x_mask_nct[t];
         const float w = std::exp(logw_nct[t]) * mask * length_scale;
-        const float w_ceil = std::ceil(w);
+        const float w_ceil = style_bert_vits2_duration_ceil(w);
         result.w[t] = w;
         result.w_ceil[t] = w_ceil;
         if (w_ceil > 0.0f) {
@@ -3251,6 +3264,26 @@ style_bert_vits2_alignment_result style_bert_vits2_runner::expand_alignment(cons
     }
     if (frames == 0) {
         frames = 1;
+    }
+    if (debug_alignment_enabled()) {
+        std::cerr << "STYLE_BERT_VITS2_ALIGNMENT tokens=" << tokens
+                  << " frames=" << frames
+                  << " length_scale=" << length_scale
+                  << " w=[";
+        for (uint32_t t = 0; t < tokens; ++t) {
+            if (t != 0) {
+                std::cerr << ",";
+            }
+            std::cerr << result.w[t];
+        }
+        std::cerr << "] w_ceil=[";
+        for (uint32_t t = 0; t < tokens; ++t) {
+            if (t != 0) {
+                std::cerr << ",";
+            }
+            std::cerr << result.w_ceil[t];
+        }
+        std::cerr << "]\n";
     }
     result.frames = frames;
     result.y_mask.assign(frames, 1.0f);
@@ -3824,15 +3857,62 @@ bool style_bert_vits2_runner::synthesize_front(const std::vector<int32_t> & phon
         return false;
     }
 
-    std::vector<float> g;
     std::vector<float> style_vec;
+    encode_style_vector(style_id, style_weight, style_vec);
+    return synthesize_front_with_style_vec(phone_ids,
+                                           tone_ids,
+                                           language_ids,
+                                           bert,
+                                           style_vec,
+                                           speaker_id,
+                                           sdp_ratio,
+                                           length_scale,
+                                           noise_scale,
+                                           noise_w_scale,
+                                           output,
+                                           alignment,
+                                           error);
+}
+
+bool style_bert_vits2_runner::synthesize_front_with_style_vec(const std::vector<int32_t> & phone_ids,
+                                                              const std::vector<int32_t> & tone_ids,
+                                                              const std::vector<int32_t> & language_ids,
+                                                              const std::vector<float> & bert,
+                                                              const std::vector<float> & style_vec,
+                                                              int32_t speaker_id,
+                                                              float sdp_ratio,
+                                                              float length_scale,
+                                                              float noise_scale,
+                                                              float noise_w_scale,
+                                                              tts_response & output,
+                                                              style_bert_vits2_alignment_result & alignment,
+                                                              std::string & error) {
+    const size_t tokens = phone_ids.size();
+    const size_t expected_bert = tokens * 1024;
+    if (tokens == 0 ||
+        tone_ids.size() != tokens ||
+        language_ids.size() != tokens ||
+        bert.size() != expected_bert ||
+        style_vec.size() != 256) {
+        error = std::format(
+            "Style-Bert front input size mismatch: tokens={}, phone_ids={}, tone_ids={}, language_ids={}, bert={} expected_bert={}, style_vec={}.",
+            tokens,
+            phone_ids.size(),
+            tone_ids.size(),
+            language_ids.size(),
+            bert.size(),
+            expected_bert,
+            style_vec.size());
+        return false;
+    }
+
+    std::vector<float> g;
     std::vector<float> x_mask(tokens, 1.0f);
     std::vector<float> x;
     std::vector<float> m_p;
     std::vector<float> logs_p;
     std::vector<float> logw;
     encode_speaker(speaker_id, g);
-    encode_style_vector(style_id, style_weight, style_vec);
     run_text_encoder(phone_ids.data(),
                      tone_ids.data(),
                      language_ids.data(),

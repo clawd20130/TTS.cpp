@@ -146,14 +146,32 @@ int main() {
         "style_bert_vits2.up.0.pre_relu",
         "style_bert_vits2.up.0.conv_transpose",
         "style_bert_vits2.up.0.res.0",
+        "style_bert_vits2.up.0.res.1",
+        "style_bert_vits2.up.0.res.2",
         "style_bert_vits2.up.0.average",
+        "style_bert_vits2.up.1.pre_relu",
         "style_bert_vits2.up.1.conv_transpose",
+        "style_bert_vits2.up.1.res.0",
+        "style_bert_vits2.up.1.res.1",
+        "style_bert_vits2.up.1.res.2",
         "style_bert_vits2.up.1.average",
+        "style_bert_vits2.up.2.pre_relu",
         "style_bert_vits2.up.2.conv_transpose",
+        "style_bert_vits2.up.2.res.0",
+        "style_bert_vits2.up.2.res.1",
+        "style_bert_vits2.up.2.res.2",
         "style_bert_vits2.up.2.average",
+        "style_bert_vits2.up.3.pre_relu",
         "style_bert_vits2.up.3.conv_transpose",
+        "style_bert_vits2.up.3.res.0",
+        "style_bert_vits2.up.3.res.1",
+        "style_bert_vits2.up.3.res.2",
         "style_bert_vits2.up.3.average",
+        "style_bert_vits2.up.4.pre_relu",
         "style_bert_vits2.up.4.conv_transpose",
+        "style_bert_vits2.up.4.res.0",
+        "style_bert_vits2.up.4.res.1",
+        "style_bert_vits2.up.4.res.2",
         "style_bert_vits2.up.4.average",
         "style_bert_vits2.final_relu",
         "style_bert_vits2.conv_post",
@@ -161,7 +179,11 @@ int main() {
     };
 
     for (const char * node : nodes) {
+        setenv("TTS_BACKEND", "cpu", 1);
+        unsetenv("TTS_BACKEND_STRICT");
         std::vector<float> expected = run_node(cpu_runner, z, g, frames, node);
+        restore_env("TTS_BACKEND", saved_backend.c_str());
+        restore_env("TTS_BACKEND_STRICT", saved_strict.c_str());
         std::vector<float> actual = run_node(accel_runner, z, g, frames, node);
         compare_node(node, actual, expected);
     }

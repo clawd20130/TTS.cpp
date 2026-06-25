@@ -163,6 +163,80 @@ int tts_style_bert_vits2_synthesize_front(tts_style_bert_vits2_handle * handle,
     }
 }
 
+int tts_style_bert_vits2_synthesize_front_with_style_vec(tts_style_bert_vits2_handle * handle,
+                                                         const int32_t * phone_ids,
+                                                         const int32_t * tone_ids,
+                                                         const int32_t * language_ids,
+                                                         size_t tokens,
+                                                         const float * bert,
+                                                         size_t bert_length,
+                                                         const float * style_vec,
+                                                         size_t style_vec_length,
+                                                         int32_t speaker_id,
+                                                         float sdp_ratio,
+                                                         float length_scale,
+                                                         float noise_scale,
+                                                         float noise_w_scale,
+                                                         tts_style_bert_vits2_float_buffer * out_audio) {
+    clear_buffer(out_audio);
+    if (!handle || !handle->runner) {
+        set_error("Style-Bert-VITS2 handle must not be null.");
+        return 0;
+    }
+    if (!out_audio) {
+        set_error("out_audio must not be null.");
+        return 0;
+    }
+    if (!phone_ids || !tone_ids || !language_ids || !bert || !style_vec) {
+        set_error("Style-Bert-VITS2 synthesis inputs must not be null.");
+        return 0;
+    }
+    if (tokens == 0) {
+        set_error("Style-Bert-VITS2 synthesis token count must not be zero.");
+        return 0;
+    }
+    if (style_vec_length != 256) {
+        set_error("Style-Bert-VITS2 style_vec length must be 256.");
+        return 0;
+    }
+
+    try {
+        std::vector<int32_t> phone(phone_ids, phone_ids + tokens);
+        std::vector<int32_t> tone(tone_ids, tone_ids + tokens);
+        std::vector<int32_t> language(language_ids, language_ids + tokens);
+        std::vector<float> bert_features(bert, bert + bert_length);
+        std::vector<float> style_features(style_vec, style_vec + style_vec_length);
+        tts_response response{};
+        style_bert_vits2_alignment_result alignment;
+        std::string error;
+        if (!handle->runner->synthesize_front_with_style_vec(phone,
+                                                             tone,
+                                                             language,
+                                                             bert_features,
+                                                             style_features,
+                                                             speaker_id,
+                                                             sdp_ratio,
+                                                             length_scale,
+                                                             noise_scale,
+                                                             noise_w_scale,
+                                                             response,
+                                                             alignment,
+                                                             error)) {
+            set_error(error.empty() ? "Style-Bert-VITS2 synthesis failed." : error);
+            return 0;
+        }
+        out_audio->data = response.data;
+        out_audio->length = response.n_outputs;
+        out_audio->hidden_size = response.hidden_size;
+        out_audio->sample_rate = handle->runner->sampling_rate;
+        last_error.clear();
+        return response.data && response.n_outputs > 0;
+    } catch (...) {
+        set_exception_error("tts_style_bert_vits2_synthesize_front_with_style_vec");
+        return 0;
+    }
+}
+
 int tts_style_bert_vits2_jp_bert_load_model(const char * model_path,
                                             int n_threads,
                                             int cpu_only,

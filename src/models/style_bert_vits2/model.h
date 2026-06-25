@@ -414,6 +414,19 @@ struct style_bert_vits2_runner : tts_generation_runner {
                           tts_response & output,
                           style_bert_vits2_alignment_result & alignment,
                           std::string & error);
+    bool synthesize_front_with_style_vec(const std::vector<int32_t> & phone_ids,
+                                         const std::vector<int32_t> & tone_ids,
+                                         const std::vector<int32_t> & language_ids,
+                                         const std::vector<float> & bert,
+                                         const std::vector<float> & style_vec,
+                                         int32_t speaker_id,
+                                         float sdp_ratio,
+                                         float length_scale,
+                                         float noise_scale,
+                                         float noise_w_scale,
+                                         tts_response & output,
+                                         style_bert_vits2_alignment_result & alignment,
+                                         std::string & error);
     ggml_cgraph * build_decoder_graph(uint32_t frames);
     void set_decoder_inputs(const float * decoder_z_nct, const float * decoder_g_nct, uint32_t frames);
     void decode(const float * decoder_z_nct, const float * decoder_g_nct, uint32_t frames, tts_response & output);

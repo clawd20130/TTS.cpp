@@ -159,5 +159,24 @@ int main() {
     ok = compare_vectors("attn", actual.attn, expected_attn, 0.0) && ok;
     ok = compare_vectors("m_p_expanded", actual.m_p_expanded, expected_m_expanded, 0.0) && ok;
     ok = compare_vectors("logs_p_expanded", actual.logs_p_expanded, expected_logs_expanded, 0.0) && ok;
+
+    std::vector<float> boundary_logw = {std::log(2.00005f)};
+    std::vector<float> boundary_mask = {1.0f};
+    std::vector<float> boundary_m((size_t) runner->model->inter_channels, 0.0f);
+    std::vector<float> boundary_logs((size_t) runner->model->inter_channels, 0.0f);
+    style_bert_vits2_alignment_result boundary =
+        runner->expand_alignment(boundary_logw.data(),
+                                 boundary_mask.data(),
+                                 boundary_m.data(),
+                                 boundary_logs.data(),
+                                 1,
+                                 1.0f);
+    if (boundary.frames != 2 || boundary.w_ceil.size() != 1 || boundary.w_ceil[0] != 2.0f) {
+        std::fprintf(stderr,
+                     "integer-boundary duration mismatch: frames=%u w_ceil=%f\n",
+                     boundary.frames,
+                     boundary.w_ceil.empty() ? -1.0f : boundary.w_ceil[0]);
+        ok = false;
+    }
     return ok ? 0 : 1;
 }
