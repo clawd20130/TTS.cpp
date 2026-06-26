@@ -7,9 +7,9 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
-#include <format>
 #include <iostream>
 #include <map>
+#include <sstream>
 #include <string_view>
 
 namespace {
@@ -3787,27 +3787,29 @@ bool style_bert_vits2_runner::synthesize_latent(const std::vector<float> & logw,
         m_p.size() != expected_text ||
         logs_p.size() != expected_text ||
         g.size() != model->gin_channels) {
-        error = std::format(
-            "Style-Bert latent input size mismatch: tokens={}, logw={}, x_mask={}, m_p={} expected_m_p={}, logs_p={} expected_logs_p={}, g={} expected_g={}.",
-            expected_tokens,
-            logw.size(),
-            x_mask.size(),
-            m_p.size(),
-            expected_text,
-            logs_p.size(),
-            expected_text,
-            g.size(),
-            model->gin_channels);
+        std::ostringstream message;
+        message << "Style-Bert latent input size mismatch: tokens=" << expected_tokens
+                << ", logw=" << logw.size()
+                << ", x_mask=" << x_mask.size()
+                << ", m_p=" << m_p.size()
+                << " expected_m_p=" << expected_text
+                << ", logs_p=" << logs_p.size()
+                << " expected_logs_p=" << expected_text
+                << ", g=" << g.size()
+                << " expected_g=" << model->gin_channels
+                << ".";
+        error = message.str();
         return false;
     }
 
     alignment = expand_alignment(logw.data(), x_mask.data(), m_p.data(), logs_p.data(), tokens, length_scale);
     const size_t expected_noise = (size_t) model->inter_channels * alignment.frames;
     if (noise.size() != expected_noise) {
-        error = std::format("Style-Bert latent noise size mismatch: got {}, expected {} for {} frames.",
-                            noise.size(),
-                            expected_noise,
-                            alignment.frames);
+        std::ostringstream message;
+        message << "Style-Bert latent noise size mismatch: got " << noise.size()
+                << ", expected " << expected_noise
+                << " for " << alignment.frames << " frames.";
+        error = message.str();
         return false;
     }
 
@@ -3846,14 +3848,15 @@ bool style_bert_vits2_runner::synthesize_front(const std::vector<int32_t> & phon
         tone_ids.size() != tokens ||
         language_ids.size() != tokens ||
         bert.size() != expected_bert) {
-        error = std::format(
-            "Style-Bert front input size mismatch: tokens={}, phone_ids={}, tone_ids={}, language_ids={}, bert={} expected_bert={}.",
-            tokens,
-            phone_ids.size(),
-            tone_ids.size(),
-            language_ids.size(),
-            bert.size(),
-            expected_bert);
+        std::ostringstream message;
+        message << "Style-Bert front input size mismatch: tokens=" << tokens
+                << ", phone_ids=" << phone_ids.size()
+                << ", tone_ids=" << tone_ids.size()
+                << ", language_ids=" << language_ids.size()
+                << ", bert=" << bert.size()
+                << " expected_bert=" << expected_bert
+                << ".";
+        error = message.str();
         return false;
     }
 
@@ -3894,15 +3897,16 @@ bool style_bert_vits2_runner::synthesize_front_with_style_vec(const std::vector<
         language_ids.size() != tokens ||
         bert.size() != expected_bert ||
         style_vec.size() != 256) {
-        error = std::format(
-            "Style-Bert front input size mismatch: tokens={}, phone_ids={}, tone_ids={}, language_ids={}, bert={} expected_bert={}, style_vec={}.",
-            tokens,
-            phone_ids.size(),
-            tone_ids.size(),
-            language_ids.size(),
-            bert.size(),
-            expected_bert,
-            style_vec.size());
+        std::ostringstream message;
+        message << "Style-Bert front input size mismatch: tokens=" << tokens
+                << ", phone_ids=" << phone_ids.size()
+                << ", tone_ids=" << tone_ids.size()
+                << ", language_ids=" << language_ids.size()
+                << ", bert=" << bert.size()
+                << " expected_bert=" << expected_bert
+                << ", style_vec=" << style_vec.size()
+                << ".";
+        error = message.str();
         return false;
     }
 
