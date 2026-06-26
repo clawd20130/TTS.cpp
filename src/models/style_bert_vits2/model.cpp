@@ -316,10 +316,10 @@ static ggml_tensor * conv1d(
                                      (int) conv.padding,
                                      (int) conv.dilation,
                                      -1.0f);
-    } else {
-        // ggml_conv_1d lowers through F16 im2col; keep Style-Bert-VITS2 convs on
-        // the F32 direct path so duration boundaries stay aligned with ONNX.
+    } else if (use_tiled) {
         cur = ggml_kokoro_conv_1d(ctx, conv.weight, conv_input, 1, (int) conv.padding, (int) conv.dilation);
+    } else {
+        cur = ggml_conv_1d(ctx, conv.weight, conv_input, 1, (int) conv.padding, (int) conv.dilation);
     }
     if (conv.bias && !fuse_bias_only) {
         cur = ggml_add(ctx, cur, conv.bias);
