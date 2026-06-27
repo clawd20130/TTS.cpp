@@ -71,6 +71,16 @@ static uint32_t metal_tiled_conv1d_min_output() {
     return (uint32_t) parsed;
 }
 
+static bool vulkan_accurate_conv1d_enabled() {
+    const char * backend = std::getenv("TTS_BACKEND");
+    const bool backend_is_vulkan = backend && std::strcmp(backend, "vulkan") == 0;
+    if (!backend_is_vulkan) {
+        return false;
+    }
+    const char * mode = std::getenv("STYLE_BERT_VITS2_VULKAN_PRECISION");
+    return mode && std::strcmp(mode, "accurate") == 0;
+}
+
 static float style_bert_vits2_duration_ceil(float w) {
     // Keep ONNX parity at integer duration boundaries. Tiny ggml/backend drift such as
     // 2.00005 should not expand to one full extra decoder frame.
@@ -316,7 +326,10 @@ static ggml_tensor * conv1d(
                                      (int) conv.padding,
                                      (int) conv.dilation,
                                      -1.0f);
-    } else if (use_tiled) {
+    } else if (use_tiled || vulkan_accurate_conv1d_enabled()) {
+        // ggml_conv_1d lowers through F16 im2col; keep Style-Bert-VITS2 convs on
+        // the F32 direct path in accurate Vulkan mode so duration boundaries stay
+        // aligned with ONNX. Default and Vulkan fast mode use ggml_conv_1d throughput.
         cur = ggml_kokoro_conv_1d(ctx, conv.weight, conv_input, 1, (int) conv.padding, (int) conv.dilation);
     } else {
         cur = ggml_conv_1d(ctx, conv.weight, conv_input, 1, (int) conv.padding, (int) conv.dilation);
