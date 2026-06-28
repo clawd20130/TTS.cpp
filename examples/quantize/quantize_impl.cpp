@@ -4,6 +4,7 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -195,6 +196,136 @@ static bool parler_is_quanitizable(std::string_view name, const quantization_par
     return quantizable;
 }
 
+static std::string_view jp_bert_tensor_body(std::string_view name) {
+    constexpr std::string_view prefix{"style-bert-vits2-jp-bert."};
+    if (name.starts_with(prefix)) {
+        return name.substr(prefix.size());
+    }
+    return name;
+}
+
+static bool jp_bert_quantize_scope_is_default(std::string_view scope) {
+    return scope.empty() || scope == "default" || scope == "linear";
+}
+
+static bool jp_bert_is_attention_q_weight(std::string_view body) {
+    return body.starts_with("layers.") && body.ends_with(".attn.self.query.weight");
+}
+
+static bool jp_bert_is_attention_k_weight(std::string_view body) {
+    return body.starts_with("layers.") && body.ends_with(".attn.self.key.weight");
+}
+
+static bool jp_bert_is_attention_v_weight(std::string_view body) {
+    return body.starts_with("layers.") && body.ends_with(".attn.self.value.weight");
+}
+
+static bool jp_bert_is_attention_out_weight(std::string_view body) {
+    return body.starts_with("layers.") && body.ends_with(".attn.out.dense.weight");
+}
+
+static bool jp_bert_is_attention_weight(std::string_view body) {
+    return jp_bert_is_attention_q_weight(body) || jp_bert_is_attention_k_weight(body) ||
+           jp_bert_is_attention_v_weight(body) || jp_bert_is_attention_out_weight(body);
+}
+
+static bool jp_bert_is_ffn_weight(std::string_view body) {
+    return body.starts_with("layers.") &&
+           (body.ends_with(".intermediate.dense.weight") || body.ends_with(".output.dense.weight"));
+}
+
+static bool jp_bert_is_embedding_weight(std::string_view body) {
+    return body == "emb.word.weight" || body == "enc.rel_embeddings.weight";
+}
+
+static bool jp_bert_is_conv_weight(std::string_view body) {
+    return body == "enc.conv.conv.weight";
+}
+
+static bool jp_bert_is_linear_weight(std::string_view body) {
+    return jp_bert_is_attention_weight(body) || jp_bert_is_ffn_weight(body);
+}
+
+static bool jp_bert_is_non_norm_weight(std::string_view body) {
+    return body.ends_with(".weight") && body.find(".norm.") == std::string_view::npos;
+}
+
+static bool style_bert_vits2_jp_bert_is_quantizable(std::string_view name, const quantization_params & params) {
+    const std::string_view body  = jp_bert_tensor_body(name);
+    const std::string_view scope = params.jp_bert_quantize_scope;
+    if (jp_bert_quantize_scope_is_default(scope)) {
+        return jp_bert_is_linear_weight(body);
+    }
+    if (parler_quantize_scope_contains(scope, "all_weights")) {
+        return jp_bert_is_non_norm_weight(body);
+    }
+    if (parler_quantize_scope_contains(scope, "linear")) {
+        if (jp_bert_is_linear_weight(body)) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scope, "ffn")) {
+        if (jp_bert_is_ffn_weight(body)) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scope, "attention")) {
+        if (jp_bert_is_attention_weight(body)) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scope, "attention_q")) {
+        if (jp_bert_is_attention_q_weight(body)) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scope, "attention_k")) {
+        if (jp_bert_is_attention_k_weight(body)) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scope, "attention_v")) {
+        if (jp_bert_is_attention_v_weight(body)) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scope, "attention_out")) {
+        if (jp_bert_is_attention_out_weight(body)) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scope, "embeddings")) {
+        if (jp_bert_is_embedding_weight(body)) {
+            return true;
+        }
+    }
+    if (parler_quantize_scope_contains(scope, "conv")) {
+        if (jp_bert_is_conv_weight(body)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool style_bert_vits2_is_quantizable(std::string_view name, const quantization_params & params) {
+    if (params.quantize_type != GGML_TYPE_F16 && params.quantize_type != GGML_TYPE_BF16) {
+        return false;
+    }
+    const std::string_view scope = params.style_bert_vits2_quantize_scope;
+    if (scope.empty() || parler_quantize_scope_contains(scope, "all")) {
+        return true;
+    }
+    if (parler_quantize_scope_contains(scope, "decoder_weights")) {
+        return name.starts_with("style_bert_vits2.decoder.") && name.ends_with(".weight");
+    }
+    if (parler_quantize_scope_contains(scope, "weights_no_embed_norm")) {
+        const bool is_weight = name.ends_with(".weight") || name.ends_with(".w");
+        return is_weight && name.find("embedding") == std::string_view::npos &&
+               name.find(".norm") == std::string_view::npos && name.find("norm_") == std::string_view::npos;
+    }
+    return false;
+}
+
 static bool is_quantizable(tts_arch arch, const std::string & name, const quantization_params & params) {
     switch (arch) {
         case PARLER_TTS_ARCH:
@@ -203,6 +334,10 @@ static bool is_quantizable(tts_arch arch, const std::string & name, const quanti
             return dia_is_quantizable(name, params);
         case KOKORO_ARCH:
             return kokoro_is_quantizable(name, params);
+        case STYLE_BERT_VITS2_ARCH:
+            return style_bert_vits2_is_quantizable(name, params);
+        case STYLE_BERT_VITS2_JP_BERT_ARCH:
+            return style_bert_vits2_jp_bert_is_quantizable(name, params);
         default:
             GGML_ABORT("%s failed. The architecture '%d' is not supported.", __func__, arch);
     }
@@ -313,7 +448,8 @@ void quantize_gguf(const char * ifile, const char * ofile, const quantization_pa
 
     if (params.quantize_type != GGML_TYPE_Q5_0 && params.quantize_type != GGML_TYPE_Q8_0 &&
         params.quantize_type != GGML_TYPE_F16 && params.quantize_type != GGML_TYPE_BF16 &&
-        params.quantize_type != GGML_TYPE_Q4_0) {
+        params.quantize_type != GGML_TYPE_Q4_0 && params.quantize_type != GGML_TYPE_Q4_K &&
+        params.quantize_type != GGML_TYPE_Q5_K && params.quantize_type != GGML_TYPE_Q6_K) {
         fprintf(stdout, "Warning, %s is untested for quantization type '%d'. Use at your own risk.\n", arch.c_str(),
                 params.quantize_type);
     }

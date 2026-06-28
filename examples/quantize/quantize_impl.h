@@ -13,6 +13,8 @@ struct quantization_params {
     bool convert_dac_to_f16;
     bool convert_non_quantizable_to_f16;
     std::string parler_quantize_scope;
+    std::string jp_bert_quantize_scope;
+    std::string style_bert_vits2_quantize_scope;
 };
 
 void quantize_gguf(const char * ifile, const char * ofile, const quantization_params & params);

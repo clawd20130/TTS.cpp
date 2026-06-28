@@ -16,8 +16,14 @@ const std::map<std::string, ggml_type> valid_quantization_types = {
     {"BFLOAT16", GGML_TYPE_BF16},
     {"Q4_0", GGML_TYPE_Q4_0},
     {"Q4", GGML_TYPE_Q4_0},
+    {"Q4_K", GGML_TYPE_Q4_K},
+    {"Q4K", GGML_TYPE_Q4_K},
     {"Q5_0", GGML_TYPE_Q5_0},
     {"Q5", GGML_TYPE_Q5_0},
+    {"Q5_K", GGML_TYPE_Q5_K},
+    {"Q5K", GGML_TYPE_Q5_K},
+    {"Q6_K", GGML_TYPE_Q6_K},
+    {"Q6K", GGML_TYPE_Q6_K},
     {"Q8_0", GGML_TYPE_Q8_0},
     {"Q8", GGML_TYPE_Q8_0},
 };
@@ -35,6 +41,8 @@ int main(int argc, const char ** argv) {
     args.add_argument(bool_arg("--quantize-cross-attn-kv", "(OPTIONAL) Whether to quantize the cross attention keys and values (only applicable for Parler TTS). Defaults to false and is true when passed (does not accept a parameter).", "-qkv"));
     args.add_argument(bool_arg("--convert-non-quantized-to-f16", "(OPTIONAL) Whether or not to convert quantization incompatible tensors to 16 bit precision. Only currently applicable to Kokoro. defaults to false.", "-nqf"));
     args.add_argument(string_arg("--parler-quantize-scope", "(OPTIONAL) Parler-only comma separated tensor scope: default, all, mlp, attention, self_attn, self_attn_q, self_attn_k, self_attn_v, self_attn_out, encoder_attn, encoder_attn_q, encoder_attn_k, encoder_attn_v, encoder_attn_out, encoder_attn_kv, output_heads, text_embeddings. Defaults to default, which preserves the legacy Parler rules.", "-pqs", false, "default"));
+    args.add_argument(string_arg("--jp-bert-quantize-scope", "(OPTIONAL) Style-Bert-VITS2 JP-BERT-only comma separated tensor scope: default, linear, ffn, attention, attention_q, attention_k, attention_v, attention_out, embeddings, conv, all_weights. Defaults to linear.", "-jbqs", false, "linear"));
+    args.add_argument(string_arg("--style-bert-vits2-quantize-scope", "(OPTIONAL) Style-Bert-VITS2 voice-only comma separated tensor scope: all, decoder_weights, weights_no_embed_norm. Defaults to all.", "-sbv2qs", false, "all"));
     args.parse(argc, argv);
     if (args.for_help) {
         args.help();
@@ -56,6 +64,8 @@ int main(int argc, const char ** argv) {
         .convert_dac_to_f16{ args.get_bool_param("--convert-dac-to-f16")},
         .convert_non_quantizable_to_f16{ args.get_bool_param("--convert-non-quantized-to-f16")},
         .parler_quantize_scope{ args.get_string_param("--parler-quantize-scope")},
+        .jp_bert_quantize_scope{ args.get_string_param("--jp-bert-quantize-scope")},
+        .style_bert_vits2_quantize_scope{ args.get_string_param("--style-bert-vits2-quantize-scope")},
     };
     quantize_gguf(args.get_string_param("--model-path").c_str(), args.get_string_param("--quantized-model-path").c_str(), qp);
     return 0;

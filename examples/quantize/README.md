@@ -6,12 +6,16 @@ This script converts a 32bit floating point TTS.cpp GGUF model file to a quantiz
  
 ### Requirements
 
-* quantize and the parler library must be built 
-* A local GGUF file for parler tts mini
+* quantize and the target model library must be built
+* A local GGUF file for a supported model architecture
 
 ### Usage
 
-**Please note** Quantization and lower precision conversion is currently only supported for Parler TTS models. 
+**Please note** Quantization and lower precision conversion is currently
+supported for selected tensors in Parler TTS, Kokoro, Dia, and
+Style-Bert-VITS2 JP-BERT models. Each architecture has its own safe tensor
+scope; do not treat a working recipe for one architecture as a default for
+another.
 
 In order to get a detailed breakdown of the functionality currently available you can call the cli with the `--help` parameter. This will return a breakdown of all parameters:
 ```bash
@@ -31,8 +35,10 @@ In order to get a detailed breakdown of the functionality currently available yo
     (OPTIONAL) Whether to quantize the cross attention keys and values (only applicable for Parler TTS). Defaults to false and is true when passed (does not accept a parameter).
 --convert-non-quantized-to-f16 (-nqf):
     (OPTIONAL) Whether or not to convert quantization incompatible tensors to 16 bit precision. Only currently applicable to Kokoror. defaults to false.
+--jp-bert-quantize-scope (-jbqs):
+    (OPTIONAL) Style-Bert-VITS2 JP-BERT-only comma separated tensor scope: default, linear, ffn, attention, attention_q, attention_k, attention_v, attention_out, embeddings, conv, all_weights. Defaults to linear.
 --model-path (-mp):
-    (REQUIRED) The local path of the gguf model file for Parler TTS mini v1 to quantize.
+    (REQUIRED) The local path of the gguf model file to quantize.
 --quantized-model-path (-qp):
     (REQUIRED) The path to save the model in a quantized format.
 ```
@@ -42,6 +48,23 @@ General usage should follow from these possible parameters. E.G. The following c
 ```bash
 ./quantize --model-path /model/path/to/gguf_file.gguf --quantized-model-path /model/path/to/new/gguf_file_q.gguf --quantized-type 2 
 ```
+
+For Style-Bert-VITS2 JP-BERT, the validated lower-precision recipe is F16
+`linear`, which converts only attention and FFN dense weights and leaves
+embeddings, conv, norm, and bias tensors as F32:
+
+```bash
+./quantize \
+  --model-path /model/path/to/style-bert-vits2-jp-bert-f32.gguf \
+  --quantized-model-path /model/path/to/style-bert-vits2-jp-bert.gguf \
+  --quantized-type F16 \
+  --jp-bert-quantize-scope linear
+```
+
+Avoid `--jp-bert-quantize-scope all_weights` for the default Vulkan JP-BERT
+asset: it can produce F16 norm inputs and abort on Vulkan backends without an
+F16 norm implementation. Q8/Q4 JP-BERT files should be validated against ONNX
+CPU audio before use.
 Valid types passed to `--quantized-type` are described by the `ggml_type` enum in GGML:
 
 ```cpp

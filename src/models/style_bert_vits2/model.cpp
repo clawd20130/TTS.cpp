@@ -2577,6 +2577,8 @@ void style_bert_vits2_runner::predict_duration(const float * x_nct,
                                                const float * g_nct,
                                                uint32_t tokens,
                                                std::vector<float> & output) {
+    const bool timings = debug_timings_enabled();
+    const auto t_start = std::chrono::steady_clock::now();
     ggml_backend_sched_reset(sctx->sched);
     ggml_cgraph * gf = build_duration_predictor_graph(tokens);
     ggml_tensor * output_tensor = gf->nodes[gf->n_nodes - 1];
@@ -2584,13 +2586,33 @@ void style_bert_vits2_runner::predict_duration(const float * x_nct,
     sctx->prep_output_buffer(output_size);
     float * output_data = (float *) ggml_backend_buffer_get_base(sctx->buf_output);
     ggml_backend_buffer_clear(sctx->buf_output, 0);
+    const auto t_built = std::chrono::steady_clock::now();
 
     sctx->alloc_graph(gf, "style_bert_vits2.duration_predictor");
+    const auto t_alloc = std::chrono::steady_clock::now();
     set_duration_predictor_inputs(x_nct, x_mask_nct, g_nct, tokens);
+    const auto t_inputs = std::chrono::steady_clock::now();
     ggml_backend_sched_graph_compute_async(sctx->sched, gf);
+    const auto t_compute = std::chrono::steady_clock::now();
     sctx->get_ggml_node_data(output_tensor, output_data, output_size);
+    const auto t_read = std::chrono::steady_clock::now();
     output.assign(output_data, output_data + ggml_nelements(output_tensor));
     ggml_backend_sched_reset(sctx->sched);
+    const auto t_done = std::chrono::steady_clock::now();
+    if (timings) {
+        std::cerr << "STYLE_BERT_VITS2_TIMING phase=duration_predictor"
+                  << " backend=" << (sctx->backend ? ggml_backend_name(sctx->backend) : "CPU")
+                  << " tokens=" << tokens
+                  << " nodes=" << gf->n_nodes
+                  << " build_ms=" << elapsed_ms(t_start, t_built)
+                  << " alloc_ms=" << elapsed_ms(t_built, t_alloc)
+                  << " input_ms=" << elapsed_ms(t_alloc, t_inputs)
+                  << " compute_submit_ms=" << elapsed_ms(t_inputs, t_compute)
+                  << " read_ms=" << elapsed_ms(t_compute, t_read)
+                  << " reset_ms=" << elapsed_ms(t_read, t_done)
+                  << " total_ms=" << elapsed_ms(t_start, t_done)
+                  << std::endl;
+    }
 }
 
 ggml_cgraph * style_bert_vits2_runner::build_stochastic_duration_condition_graph(uint32_t tokens) {
@@ -2646,6 +2668,8 @@ void style_bert_vits2_runner::run_stochastic_duration_condition(const float * x_
                                                                 const float * g_nct,
                                                                 uint32_t tokens,
                                                                 std::vector<float> & output) {
+    const bool timings = debug_timings_enabled();
+    const auto t_start = std::chrono::steady_clock::now();
     ggml_backend_sched_reset(sctx->sched);
     ggml_cgraph * gf = build_stochastic_duration_condition_graph(tokens);
     ggml_tensor * output_tensor = gf->nodes[gf->n_nodes - 1];
@@ -2653,11 +2677,16 @@ void style_bert_vits2_runner::run_stochastic_duration_condition(const float * x_
     sctx->prep_output_buffer(output_size);
     float * output_data = (float *) ggml_backend_buffer_get_base(sctx->buf_output);
     ggml_backend_buffer_clear(sctx->buf_output, 0);
+    const auto t_built = std::chrono::steady_clock::now();
 
     sctx->alloc_graph(gf, "style_bert_vits2.sdp.condition");
+    const auto t_alloc = std::chrono::steady_clock::now();
     set_stochastic_duration_condition_inputs(x_nct, x_mask_nct, g_nct, tokens);
+    const auto t_inputs = std::chrono::steady_clock::now();
     ggml_backend_sched_graph_compute_async(sctx->sched, gf);
+    const auto t_compute = std::chrono::steady_clock::now();
     sctx->get_ggml_node_data(output_tensor, output_data, output_size);
+    const auto t_read = std::chrono::steady_clock::now();
 
     output.assign((size_t) model->hidden_channels * tokens, 0.0f);
     for (uint32_t c = 0; c < model->hidden_channels; ++c) {
@@ -2666,6 +2695,21 @@ void style_bert_vits2_runner::run_stochastic_duration_condition(const float * x_
         }
     }
     ggml_backend_sched_reset(sctx->sched);
+    const auto t_done = std::chrono::steady_clock::now();
+    if (timings) {
+        std::cerr << "STYLE_BERT_VITS2_TIMING phase=sdp_condition"
+                  << " backend=" << (sctx->backend ? ggml_backend_name(sctx->backend) : "CPU")
+                  << " tokens=" << tokens
+                  << " nodes=" << gf->n_nodes
+                  << " build_ms=" << elapsed_ms(t_start, t_built)
+                  << " alloc_ms=" << elapsed_ms(t_built, t_alloc)
+                  << " input_ms=" << elapsed_ms(t_alloc, t_inputs)
+                  << " compute_submit_ms=" << elapsed_ms(t_inputs, t_compute)
+                  << " read_ms=" << elapsed_ms(t_compute, t_read)
+                  << " copy_ms=" << elapsed_ms(t_read, t_done)
+                  << " total_ms=" << elapsed_ms(t_start, t_done)
+                  << std::endl;
+    }
 }
 
 ggml_cgraph * style_bert_vits2_runner::build_stochastic_duration_reverse_graph(uint32_t tokens) {
@@ -2727,6 +2771,8 @@ void style_bert_vits2_runner::run_stochastic_duration_reverse(const float * z_nc
                                                               const float * condition_nct,
                                                               uint32_t tokens,
                                                               std::vector<float> & output) {
+    const bool timings = debug_timings_enabled();
+    const auto t_start = std::chrono::steady_clock::now();
     ggml_backend_sched_reset(sctx->sched);
     ggml_cgraph * gf = build_stochastic_duration_reverse_graph(tokens);
     ggml_tensor * output_tensor = gf->nodes[gf->n_nodes - 1];
@@ -2734,17 +2780,37 @@ void style_bert_vits2_runner::run_stochastic_duration_reverse(const float * z_nc
     sctx->prep_output_buffer(output_size);
     float * output_data = (float *) ggml_backend_buffer_get_base(sctx->buf_output);
     ggml_backend_buffer_clear(sctx->buf_output, 0);
+    const auto t_built = std::chrono::steady_clock::now();
 
     sctx->alloc_graph(gf, "style_bert_vits2.sdp.reverse");
+    const auto t_alloc = std::chrono::steady_clock::now();
     set_stochastic_duration_reverse_inputs(z_nct, x_mask_nct, condition_nct, tokens);
+    const auto t_inputs = std::chrono::steady_clock::now();
     ggml_backend_sched_graph_compute_async(sctx->sched, gf);
+    const auto t_compute = std::chrono::steady_clock::now();
     sctx->get_ggml_node_data(output_tensor, output_data, output_size);
+    const auto t_read = std::chrono::steady_clock::now();
 
     output.assign((size_t) tokens, 0.0f);
     for (uint32_t t = 0; t < tokens; ++t) {
         output[t] = output_data[t];
     }
     ggml_backend_sched_reset(sctx->sched);
+    const auto t_done = std::chrono::steady_clock::now();
+    if (timings) {
+        std::cerr << "STYLE_BERT_VITS2_TIMING phase=sdp_reverse"
+                  << " backend=" << (sctx->backend ? ggml_backend_name(sctx->backend) : "CPU")
+                  << " tokens=" << tokens
+                  << " nodes=" << gf->n_nodes
+                  << " build_ms=" << elapsed_ms(t_start, t_built)
+                  << " alloc_ms=" << elapsed_ms(t_built, t_alloc)
+                  << " input_ms=" << elapsed_ms(t_alloc, t_inputs)
+                  << " compute_submit_ms=" << elapsed_ms(t_inputs, t_compute)
+                  << " read_ms=" << elapsed_ms(t_compute, t_read)
+                  << " copy_ms=" << elapsed_ms(t_read, t_done)
+                  << " total_ms=" << elapsed_ms(t_start, t_done)
+                  << std::endl;
+    }
 }
 
 ggml_cgraph * style_bert_vits2_runner::build_text_encoder_projection_graph(uint32_t tokens) {
@@ -3140,6 +3206,8 @@ void style_bert_vits2_runner::run_text_encoder(const int32_t * phone_ids,
                                                std::vector<float> & x_nct,
                                                std::vector<float> & m_p_nct,
                                                std::vector<float> & logs_p_nct) {
+    const bool timings = debug_timings_enabled();
+    const auto t_start = std::chrono::steady_clock::now();
     ggml_backend_sched_reset(sctx->sched);
     ggml_cgraph * gf = build_text_encoder_graph(tokens);
     ggml_tensor * output_tensor = sctx->text_encoder_stats_output;
@@ -3148,8 +3216,10 @@ void style_bert_vits2_runner::run_text_encoder(const int32_t * phone_ids,
     sctx->prep_output_buffer(output_size);
     float * output_data = (float *) ggml_backend_buffer_get_base(sctx->buf_output);
     ggml_backend_buffer_clear(sctx->buf_output, 0);
+    const auto t_built = std::chrono::steady_clock::now();
 
     sctx->alloc_graph(gf, "style_bert_vits2.text_encoder");
+    const auto t_alloc = std::chrono::steady_clock::now();
     set_text_encoder_input_inputs(phone_ids, tone_ids, language_ids, bert_t_major, style_vec, tokens);
     ggml_backend_tensor_set(sctx->encoder_layer_x_mask, x_mask_nct, 0, (size_t) tokens * sizeof(float));
     if (g_nct) {
@@ -3162,9 +3232,12 @@ void style_bert_vits2_runner::run_text_encoder(const int32_t * phone_ids,
         sctx->encoder_rel_pos_ids,
         tokens,
         model->text_encoder.encoder.window_size);
+    const auto t_inputs = std::chrono::steady_clock::now();
     ggml_backend_sched_graph_compute_async(sctx->sched, gf);
+    const auto t_compute = std::chrono::steady_clock::now();
 
     sctx->get_ggml_node_data(output_tensor, output_data, output_size);
+    const auto t_read = std::chrono::steady_clock::now();
     x_nct.assign((size_t) model->hidden_channels * tokens, 0.0f);
     for (uint32_t c = 0; c < model->hidden_channels; ++c) {
         for (uint32_t t = 0; t < tokens; ++t) {
@@ -3184,6 +3257,21 @@ void style_bert_vits2_runner::run_text_encoder(const int32_t * phone_ids,
         }
     }
     ggml_backend_sched_reset(sctx->sched);
+    const auto t_done = std::chrono::steady_clock::now();
+    if (timings) {
+        std::cerr << "STYLE_BERT_VITS2_TIMING phase=text_encoder"
+                  << " backend=" << (sctx->backend ? ggml_backend_name(sctx->backend) : "CPU")
+                  << " tokens=" << tokens
+                  << " nodes=" << gf->n_nodes
+                  << " build_ms=" << elapsed_ms(t_start, t_built)
+                  << " alloc_ms=" << elapsed_ms(t_built, t_alloc)
+                  << " input_ms=" << elapsed_ms(t_alloc, t_inputs)
+                  << " compute_submit_ms=" << elapsed_ms(t_inputs, t_compute)
+                  << " read_ms=" << elapsed_ms(t_compute, t_read)
+                  << " copy_ms=" << elapsed_ms(t_read, t_done)
+                  << " total_ms=" << elapsed_ms(t_start, t_done)
+                  << std::endl;
+    }
 }
 
 ggml_cgraph * style_bert_vits2_runner::build_text_encoder_ffn_graph(uint32_t layer_index, uint32_t tokens) {

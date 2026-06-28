@@ -172,7 +172,8 @@ to TTS.cpp.
 Download the current GGUF assets from the same repository. `voices/*.gguf`
 contains Style-Bert-VITS2 TTS models. `frontend/style-bert-vits2-jp-bert.gguf`
 is the required JP-BERT frontend feature extractor used by those TTS models; it
-is not a standalone TTS model.
+is not a standalone TTS model. The published JP-BERT artifact uses F16 `linear`
+weights while keeping embeddings, conv, norm, and bias tensors F32.
 
 ```bash
 hf download kevinzhow/style-bert-vits2-gguf \
@@ -327,8 +328,21 @@ python3 ./py-gguf/convert_style_bert_vits2_jp_bert_to_gguf \
 
 See the [quantization cli readme](./examples/quantize/README.md) for more
 details on its general usage and behavior. Quantization and lower precision
-conversion are currently only supported for the older generative models; the
-Style-Bert-VITS2 GGUF assets described above are F32.
+conversion are supported for JP-BERT linear weights. The published
+Style-Bert-VITS2 JP-BERT frontend artifact is generated with:
+
+```bash
+./build/bin/quantize \
+  --model-path ./tmp/style-bert-vits2-gguf/frontend/style-bert-vits2-jp-bert-f32.gguf \
+  --quantized-model-path ./tmp/style-bert-vits2-gguf/frontend/style-bert-vits2-jp-bert.gguf \
+  --quantized-type F16 \
+  --jp-bert-quantize-scope linear
+```
+
+Do not use `--jp-bert-quantize-scope all_weights` as the default Vulkan asset:
+it can route norm inputs through F16 tensors and abort on backends that do not
+implement F16 norm. Q8/Q4 JP-BERT recipes need separate audio-parity validation
+before being used as defaults.
 
 ### Performance
 
