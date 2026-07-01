@@ -208,6 +208,7 @@ TTS_BACKEND=vulkan TTS_DEVICE=0 TTS_BACKEND_STRICT=1 \
   ./build-vulkan/bin/tts-server \
   --model-path ./tmp/style-bert-vits2-gguf/voices \
   --default-model jvnv-F1-jp-full-sdp \
+  --lazy-load-models \
   --host 127.0.0.1 \
   --port 18102 \
   --backend vulkan
@@ -226,7 +227,8 @@ For local macOS Metal runs, use the same commands with `build-metal` and
 
 `tts-server` can also load a directory of `.gguf` files. When a directory
 contains multiple models, pass the desired model ID in each request's `model`
-field or set `--default-model`.
+field or set `--default-model`. Add `--lazy-load-models` to expose every model
+in `/v1/models` while deferring each GGUF load until it is first requested.
 
 Verify the loaded decoder models before wiring an application or sidecar to the
 server:

@@ -31,6 +31,8 @@ In order to get a detailed breakdown of the functionality currently available yo
     (OPTIONAL) Runtime backend: auto, cpu, metal, or vulkan. Overrides TTS_BACKEND.
 --use-metal (-m):
     (OPTIONAL) Whether to use metal acceleration
+--lazy-load-models (-llm):
+    (OPTIONAL) When --model-path is a directory, defer loading each model until it is first requested.
 --no-cross-attn (-ca):
     (OPTIONAL) Whether to not include cross attention
 --model-path (-mp):
@@ -49,7 +51,7 @@ In order to get a detailed breakdown of the functionality currently available yo
     (OPTIONAL) The espeak voice id to use for phonemization. This should only be specified when the correct espeak voice cannot be inferred from the kokoro voice (see #MultiLanguage Configuration in the cli README for more info).
 ```
 
-Important configuration here includes `--n-parallelism` which describes how may models for asynchronous processing and `--model-path` which describes from where to load the model locally.
+Important configuration here includes `--n-parallelism` which describes how may models for asynchronous processing and `--model-path` which describes from where to load the model locally. When `--model-path` points to a directory, `--lazy-load-models` keeps startup memory low by loading each listed model on first use.
 
 Simple local usage can be achieved via the following simple command:
 

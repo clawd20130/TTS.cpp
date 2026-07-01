@@ -334,7 +334,24 @@ void init_response_map(simple_response_map * rmap) {
 }
 
 struct worker {
-    worker(struct simple_task_queue * task_queue, struct simple_response_map * response_map, std::string text_encoder_path = "", int task_timeout = 300): task_queue(task_queue), response_map(response_map), text_encoder_path(text_encoder_path), task_timeout(task_timeout) {};
+    worker(struct simple_task_queue * task_queue,
+           struct simple_response_map * response_map,
+           std::string text_encoder_path = "",
+           int task_timeout = 300,
+           std::unordered_map<std::string, std::string> model_paths = {},
+           int n_threads = 0,
+           bool cpu_only = true,
+           generation_configuration generation_config = {},
+           bool lazy_load_models = false):
+        task_queue(task_queue),
+        response_map(response_map),
+        model_paths(std::move(model_paths)),
+        text_encoder_path(text_encoder_path),
+        n_threads(n_threads),
+        cpu_only(cpu_only),
+        generation_config(generation_config),
+        lazy_load_models(lazy_load_models),
+        task_timeout(task_timeout) {};
     ~worker() {
         // runners.clear();
         for (auto & runner : views::values(runners)) {
@@ -345,7 +362,12 @@ struct worker {
     struct simple_response_map * response_map;
 
     unordered_map<string, unique_ptr<tts_generation_runner>> runners{};
+    std::unordered_map<std::string, std::string> model_paths{};
     std::string text_encoder_path;
+    int n_threads;
+    bool cpu_only;
+    generation_configuration generation_config;
+    bool lazy_load_models;
     std::atomic<bool> running = true;
     tts_server_threading::native_thread * thread = nullptr;
 
@@ -364,12 +386,36 @@ struct worker {
         }
     }
 
+    tts_generation_runner * runner_for_task(struct simple_server_task * task) {
+        auto runner = runners.find(task->model);
+        if (runner != runners.end()) {
+            return runner->second.get();
+        }
+        if (!lazy_load_models) {
+            return nullptr;
+        }
+        auto model_path = model_paths.find(task->model);
+        if (model_path == model_paths.end()) {
+            return nullptr;
+        }
+        fprintf(stdout, "worker: lazy loading model %s from %s\n", task->model.c_str(), model_path->second.c_str());
+        runners[task->model] = runner_from_file(model_path->second.c_str(), n_threads, generation_config, cpu_only);
+        return runners[task->model].get();
+    }
+
     const void process_task(struct simple_server_task * task) {
         if (task->timed_out(task_timeout)) {
             return;
         }
         tts_response * data = nullptr;
-        tts_generation_runner & runner{*runners[task->model]};
+        tts_generation_runner * runner_ptr = runner_for_task(task);
+        if (!runner_ptr) {
+            task->success = false;
+            task->message = std::format("Model '{}' is not loaded and cannot be lazy-loaded.", task->model);
+            response_map->push(task);
+            return;
+        }
+        tts_generation_runner & runner{*runner_ptr};
         switch(task->task) {
             case TTS: {
                 const std::string unsupported_message = generic_tts_unsupported_message(runner);
@@ -584,9 +630,11 @@ struct worker {
     }
 };
 
-void init_worker(std::unordered_map<std::string, std::string>* model_path, int n_threads, bool cpu_only, const generation_configuration & config, worker * w) {
-    for (const auto &[id, path] : *model_path) {
-        w->runners[id] = runner_from_file(path.c_str(), n_threads, config, cpu_only);
+void init_worker(std::unordered_map<std::string, std::string>* model_path, int n_threads, bool cpu_only, const generation_configuration & config, worker * w, bool lazy_load_models = false) {
+    if (!lazy_load_models) {
+        for (const auto &[id, path] : *model_path) {
+            w->runners[id] = runner_from_file(path.c_str(), n_threads, config, cpu_only);
+        }
     }
     w->loop();
 }
@@ -974,6 +1022,7 @@ int main(int argc, const char ** argv) {
     args.add_argument(int_arg("--n-threads", "The number of cpu threads to run generation with. Defaults to hardware concurrency.", "-nt", false, &default_n_threads));
     args.add_argument(string_arg("--backend", "(OPTIONAL) Runtime backend: auto, cpu, metal, or vulkan. Overrides TTS_BACKEND.", "-b", false));
     args.add_argument(bool_arg("--use-metal", "(OPTIONAL) Whether to use metal acceleration", "-m"));
+    args.add_argument(bool_arg("--lazy-load-models", "(OPTIONAL) When --model-path is a directory, defer loading each model until it is first requested.", "-llm"));
     args.add_argument(bool_arg("--no-cross-attn", "(OPTIONAL) Whether to not include cross attention", "-ca"));
     args.add_argument(string_arg("--text-encoder-path", "(OPTIONAL) The local path of the text encoder gguf model for conditional generaiton.", "-tep", false));
     args.add_argument(string_arg("--ssl-file-cert", "(OPTIONAL) The local path to the PEM encoded ssl cert.", "-sfc", false));
@@ -1956,13 +2005,31 @@ int main(int argc, const char ** argv) {
     for (int i = *args.get_int_param("--n-parallelism"); i > 0; i--) {
         if (i == 1) {
             fprintf(stdout, "%s: server is listening on http://%s:%d\n", __func__, args.get_string_param("--host").c_str(), *args.get_int_param("--port"));
-            worker * w = new worker(tqueue, rmap, args.get_string_param("--text-encoder-path"), *args.get_int_param("--timeout"));
+            worker * w = new worker(
+                tqueue,
+                rmap,
+                args.get_string_param("--text-encoder-path"),
+                *args.get_int_param("--timeout"),
+                model_map,
+                *args.get_int_param("--n-threads"),
+                !args.get_bool_param("--use-metal"),
+                default_generation_config,
+                args.get_bool_param("--lazy-load-models"));
             state.store(READY);
             pool->push_back(w);
-            init_worker(&model_map, *args.get_int_param("--n-threads"), !args.get_bool_param("--use-metal"), default_generation_config, w);
+            init_worker(&model_map, *args.get_int_param("--n-threads"), !args.get_bool_param("--use-metal"), default_generation_config, w, args.get_bool_param("--lazy-load-models"));
         } else {
-            worker * w = new worker(tqueue, rmap, args.get_string_param("--text-encoder-path"), *args.get_int_param("--timeout"));
-            w->thread = new tts_server_threading::native_thread(init_worker, &model_map, *args.get_int_param("--n-threads"), !args.get_bool_param("--use-metal"), default_generation_config, w);
+            worker * w = new worker(
+                tqueue,
+                rmap,
+                args.get_string_param("--text-encoder-path"),
+                *args.get_int_param("--timeout"),
+                model_map,
+                *args.get_int_param("--n-threads"),
+                !args.get_bool_param("--use-metal"),
+                default_generation_config,
+                args.get_bool_param("--lazy-load-models"));
+            w->thread = new tts_server_threading::native_thread(init_worker, &model_map, *args.get_int_param("--n-threads"), !args.get_bool_param("--use-metal"), default_generation_config, w, args.get_bool_param("--lazy-load-models"));
             pool->push_back(w);
         }
     }
