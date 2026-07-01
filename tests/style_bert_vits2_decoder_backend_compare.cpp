@@ -53,7 +53,11 @@ std::vector<float> run_node(style_bert_vits2_runner * runner,
                             const char * node_name) {
     setenv("STYLE_BERT_VITS2_DEBUG_OUTPUT_NODE", node_name, 1);
     tts_response response{};
-    runner->decode(z.data(), g.data(), frames, response);
+    std::string error;
+    if (!runner->decode(z.data(), g.data(), frames, response, &error)) {
+        std::fprintf(stderr, "decoder compare failed for %s: %s\n", node_name, error.c_str());
+        return {};
+    }
     return std::vector<float>(response.data, response.data + response.n_outputs);
 }
 
@@ -113,8 +117,10 @@ int main() {
     generation_configuration config;
     const char * original_backend = std::getenv("TTS_BACKEND");
     const char * original_strict = std::getenv("TTS_BACKEND_STRICT");
+    const char * original_max_frames = std::getenv("STYLE_BERT_VITS2_MAX_DECODER_FRAMES");
     std::string saved_backend = original_backend ? original_backend : "";
     std::string saved_strict = original_strict ? original_strict : "";
+    std::string saved_max_frames = original_max_frames ? original_max_frames : "";
 
     setenv("TTS_BACKEND", "cpu", 1);
     unsetenv("TTS_BACKEND_STRICT");
@@ -125,6 +131,20 @@ int main() {
         return 1;
     }
     const uint32_t frames = (uint32_t) (z.size() / cpu_runner->model->inter_channels);
+    if (frames > 1) {
+        tts_response limited_response{};
+        std::string limit_error;
+        setenv("STYLE_BERT_VITS2_MAX_DECODER_FRAMES", "1", 1);
+        if (cpu_runner->decode(z.data(), g.data(), frames, limited_response, &limit_error)) {
+            std::fprintf(stderr, "expected decoder frame limit failure for %u frames\n", frames);
+            return 1;
+        }
+        if (limit_error.find("STYLE_BERT_VITS2_MAX_DECODER_FRAMES") == std::string::npos) {
+            std::fprintf(stderr, "unexpected decoder frame limit error: %s\n", limit_error.c_str());
+            return 1;
+        }
+        restore_env("STYLE_BERT_VITS2_MAX_DECODER_FRAMES", saved_max_frames.c_str());
+    }
 
     restore_env("TTS_BACKEND", saved_backend.c_str());
     restore_env("TTS_BACKEND_STRICT", saved_strict.c_str());

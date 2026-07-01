@@ -429,7 +429,11 @@ struct style_bert_vits2_runner : tts_generation_runner {
                                          std::string & error);
     ggml_cgraph * build_decoder_graph(uint32_t frames);
     void set_decoder_inputs(const float * decoder_z_nct, const float * decoder_g_nct, uint32_t frames);
-    void decode(const float * decoder_z_nct, const float * decoder_g_nct, uint32_t frames, tts_response & output);
+    bool decode(const float * decoder_z_nct,
+                const float * decoder_g_nct,
+                uint32_t frames,
+                tts_response & output,
+                std::string * error = nullptr);
     void generate(const char * sentence, tts_response & output, const generation_configuration & config) override;
 };
 

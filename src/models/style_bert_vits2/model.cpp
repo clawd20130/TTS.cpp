@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -25,6 +26,8 @@ static std::string style_shape(const ggml_tensor * tensor) {
     return "[" + std::to_string(tensor->ne[0]) + "," + std::to_string(tensor->ne[1]) + "," +
         std::to_string(tensor->ne[2]) + "," + std::to_string(tensor->ne[3]) + "]";
 }
+
+static constexpr uint32_t DEFAULT_STYLE_BERT_VITS2_MAX_DECODER_FRAMES = 1536;
 
 static bool debug_timings_enabled() {
     const char * env = std::getenv("STYLE_BERT_VITS2_DEBUG_TIMINGS");
@@ -167,6 +170,42 @@ static size_t style_bert_vits2_graph_max_nodes(size_t model_max_nodes) {
         }
     }
     return std::max<size_t>(model_max_nodes, configured);
+}
+
+static uint32_t style_bert_vits2_max_decoder_frames() {
+    const char * env = std::getenv("STYLE_BERT_VITS2_MAX_DECODER_FRAMES");
+    if (!env || !env[0]) {
+        return DEFAULT_STYLE_BERT_VITS2_MAX_DECODER_FRAMES;
+    }
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (end == env || *end != '\0') {
+        return DEFAULT_STYLE_BERT_VITS2_MAX_DECODER_FRAMES;
+    }
+    if (parsed > UINT32_MAX) {
+        return UINT32_MAX;
+    }
+    return (uint32_t) parsed;
+}
+
+static bool validate_style_bert_vits2_decoder_frames(uint32_t frames, uint32_t tokens, std::string & error) {
+    if (frames == 0) {
+        error = "Style-Bert decoder frame count must be greater than 0.";
+        return false;
+    }
+    const uint32_t max_frames = style_bert_vits2_max_decoder_frames();
+    if (max_frames == 0 || frames <= max_frames) {
+        return true;
+    }
+    std::ostringstream message;
+    message << "Style-Bert decoder frame count exceeds STYLE_BERT_VITS2_MAX_DECODER_FRAMES: "
+            << "frames=" << frames << " > max=" << max_frames;
+    if (tokens > 0) {
+        message << ", tokens=" << tokens;
+    }
+    message << ". Split the request before synthesis or raise the limit only on a backend with enough memory.";
+    error = message.str();
+    return false;
 }
 
 static const char * debug_output_node_name() {
@@ -3904,6 +3943,9 @@ bool style_bert_vits2_runner::synthesize_latent(const std::vector<float> & logw,
     }
 
     alignment = expand_alignment(logw.data(), x_mask.data(), m_p.data(), logs_p.data(), tokens, length_scale);
+    if (!validate_style_bert_vits2_decoder_frames(alignment.frames, tokens, error)) {
+        return false;
+    }
     const size_t expected_noise = (size_t) model->inter_channels * alignment.frames;
     if (noise.size() != expected_noise) {
         std::ostringstream message;
@@ -3925,8 +3967,7 @@ bool style_bert_vits2_runner::synthesize_latent(const std::vector<float> & logw,
                          length_scale,
                          noise_scale,
                          decoder_z);
-    decode(decoder_z.data(), g.data(), alignment.frames, output);
-    return output.n_outputs != 0;
+    return decode(decoder_z.data(), g.data(), alignment.frames, output, &error);
 }
 
 bool style_bert_vits2_runner::synthesize_front(const std::vector<int32_t> & phone_ids,
@@ -4058,6 +4099,9 @@ bool style_bert_vits2_runner::synthesize_front_with_style_vec(const std::vector<
     }
 
     alignment = expand_alignment(logw.data(), x_mask.data(), m_p.data(), logs_p.data(), (uint32_t) tokens, length_scale);
+    if (!validate_style_bert_vits2_decoder_frames(alignment.frames, (uint32_t) tokens, error)) {
+        return false;
+    }
     std::vector<float> noise((size_t) model->inter_channels * alignment.frames);
     random_normal_gen((int) noise.size(), noise.data());
     std::vector<float> decoder_z;
@@ -4071,8 +4115,7 @@ bool style_bert_vits2_runner::synthesize_front_with_style_vec(const std::vector<
                          length_scale,
                          noise_scale,
                          decoder_z);
-    decode(decoder_z.data(), g.data(), alignment.frames, output);
-    return output.n_outputs != 0;
+    return decode(decoder_z.data(), g.data(), alignment.frames, output, &error);
 }
 
 ggml_cgraph * style_bert_vits2_runner::build_decoder_graph(uint32_t frames) {
@@ -4120,7 +4163,22 @@ void style_bert_vits2_runner::set_decoder_inputs(const float * decoder_z_nct, co
     }
 }
 
-void style_bert_vits2_runner::decode(const float * decoder_z_nct, const float * decoder_g_nct, uint32_t frames, tts_response & output) {
+bool style_bert_vits2_runner::decode(const float * decoder_z_nct,
+                                     const float * decoder_g_nct,
+                                     uint32_t frames,
+                                     tts_response & output,
+                                     std::string * error) {
+    output.data = nullptr;
+    output.n_outputs = 0;
+    output.hidden_size = 0;
+    std::string frame_error;
+    if (!validate_style_bert_vits2_decoder_frames(frames, 0, frame_error)) {
+        if (error) {
+            *error = frame_error;
+        }
+        return false;
+    }
+
     const bool debug_timings = debug_timings_enabled();
     const auto t_start = std::chrono::steady_clock::now();
     ggml_backend_sched_reset(sctx->sched);
@@ -4177,6 +4235,10 @@ void style_bert_vits2_runner::decode(const float * decoder_z_nct, const float * 
                   << " total_ms=" << elapsed_ms(t_start, t_done)
                   << std::endl;
     }
+    if (error) {
+        error->clear();
+    }
+    return output.n_outputs != 0;
 }
 
 void style_bert_vits2_runner::generate(const char *, tts_response & output, const generation_configuration &) {

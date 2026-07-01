@@ -297,6 +297,7 @@ Useful diagnostic and tuning environment variables:
 | `STYLE_BERT_VITS2_DEBUG_TIMINGS=1` | Print graph timing breakdowns for decoder, latent, flow, and front-end phases |
 | `STYLE_BERT_VITS2_DEBUG_LOAD=1` | Print Style-Bert load details and Vulkan precision mode |
 | `STYLE_BERT_VITS2_JP_BERT_DEBUG_LOAD=1` | Print JP-BERT load details and Vulkan precision mode |
+| `STYLE_BERT_VITS2_MAX_DECODER_FRAMES=1536` | Reject oversized Style-Bert decoder requests before ggml graph allocation; set `0` only for controlled memory experiments |
 | `STYLE_BERT_VITS2_ATTENTION_MODE=full` | Force the current full attention path |
 | `STYLE_BERT_VITS2_FLOW_GROUP_SIZE=<n>` | Group flow reverse layers during profiling |
 | `STYLE_BERT_VITS2_FLOW_FUSED=1` | Use the fused flow graph experiment |

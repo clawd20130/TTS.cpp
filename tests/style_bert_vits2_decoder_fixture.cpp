@@ -117,7 +117,11 @@ int main() {
     }
 
     tts_response response{};
-    runner->decode(z.data(), g.data(), frames, response);
+    std::string decode_error;
+    if (!runner->decode(z.data(), g.data(), frames, response, &decode_error)) {
+        std::fprintf(stderr, "decoder fixture failed: %s\n", decode_error.c_str());
+        return 1;
+    }
     std::vector<float> actual(response.data, response.data + response.n_outputs);
     if (!compare_vectors(actual, expected, 1e-4)) {
         return 1;

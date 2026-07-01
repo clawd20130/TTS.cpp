@@ -158,6 +158,7 @@ static json style_bert_vits2_runtime_config() {
         {"device_env", env_string_or_default("TTS_DEVICE", "")},
         {"attention_mode", attention_mode},
         {"debug_timings", env_enabled("STYLE_BERT_VITS2_DEBUG_TIMINGS")},
+        {"max_decoder_frames", env_string_or_default("STYLE_BERT_VITS2_MAX_DECODER_FRAMES", "1536")},
         {"flow_fused", flow_fused},
         {"flow_group_size", flow_group_size},
         {"flow_mode", flow_fused ? "fused" : (flow_group_size == "1" ? "step" : "group")},
@@ -489,11 +490,31 @@ struct worker {
                     response_map->push(task);
                     break;
                 }
+                if (task->style_bert_decoder_frames == 0 ||
+                    task->style_bert_decoder_z.size() !=
+                        (size_t) task->style_bert_decoder_frames * style_runner->model->inter_channels ||
+                    task->style_bert_decoder_g.size() != style_runner->model->gin_channels) {
+                    task->message = std::format("Style-Bert decoder input size mismatch: frames={}, decoder_z={}, expected_z={}, decoder_g={}, expected_g={}.",
+                                                task->style_bert_decoder_frames,
+                                                task->style_bert_decoder_z.size(),
+                                                (size_t) task->style_bert_decoder_frames * style_runner->model->inter_channels,
+                                                task->style_bert_decoder_g.size(),
+                                                style_runner->model->gin_channels);
+                    response_map->push(task);
+                    break;
+                }
                 data = new tts_response;
-                style_runner->decode(task->style_bert_decoder_z.data(),
-                                     task->style_bert_decoder_g.data(),
-                                     task->style_bert_decoder_frames,
-                                     *data);
+                std::string error;
+                if (!style_runner->decode(task->style_bert_decoder_z.data(),
+                                          task->style_bert_decoder_g.data(),
+                                          task->style_bert_decoder_frames,
+                                          *data,
+                                          &error)) {
+                    task->message = error.empty() ? "Style-Bert decoder failed." : error;
+                    delete data;
+                    response_map->push(task);
+                    break;
+                }
                 task->response    = (void *) data->data;
                 task->length      = data->n_outputs;
                 task->sample_rate = style_runner->sampling_rate;
