@@ -42,7 +42,7 @@ int main(int argc, const char ** argv) {
     args.add_argument(bool_arg("--convert-non-quantized-to-f16", "(OPTIONAL) Whether or not to convert quantization incompatible tensors to 16 bit precision. Only currently applicable to Kokoro. defaults to false.", "-nqf"));
     args.add_argument(string_arg("--parler-quantize-scope", "(OPTIONAL) Parler-only comma separated tensor scope: default, all, mlp, attention, self_attn, self_attn_q, self_attn_k, self_attn_v, self_attn_out, encoder_attn, encoder_attn_q, encoder_attn_k, encoder_attn_v, encoder_attn_out, encoder_attn_kv, output_heads, text_embeddings. Defaults to default, which preserves the legacy Parler rules.", "-pqs", false, "default"));
     args.add_argument(string_arg("--jp-bert-quantize-scope", "(OPTIONAL) Style-Bert-VITS2 JP-BERT-only comma separated tensor scope: default, linear, ffn, attention, attention_q, attention_k, attention_v, attention_out, embeddings, conv, all_weights. Defaults to linear.", "-jbqs", false, "linear"));
-    args.add_argument(string_arg("--style-bert-vits2-quantize-scope", "(OPTIONAL) Style-Bert-VITS2 voice-only comma separated tensor scope: all, decoder_weights, weights_no_embed_norm. Defaults to all.", "-sbv2qs", false, "all"));
+    args.add_argument(string_arg("--style-bert-vits2-quantize-scope", "(OPTIONAL) Style-Bert-VITS2 voice-only comma separated tensor scope: all, decoder_weights, weights_no_embed_norm, weights_no_embed_norm_no_ups. Defaults to all.", "-sbv2qs", false, "all"));
     args.parse(argc, argv);
     if (args.for_help) {
         args.help();

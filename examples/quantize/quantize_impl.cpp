@@ -323,6 +323,13 @@ static bool style_bert_vits2_is_quantizable(std::string_view name, const quantiz
         return is_weight && name.find("embedding") == std::string_view::npos &&
                name.find(".norm") == std::string_view::npos && name.find("norm_") == std::string_view::npos;
     }
+    if (parler_quantize_scope_contains(scope, "weights_no_embed_norm_no_ups") ||
+        parler_quantize_scope_contains(scope, "no_embed_norm_no_ups")) {
+        const bool is_weight = name.ends_with(".weight") || name.ends_with(".w");
+        return is_weight && name.find("embedding") == std::string_view::npos &&
+               name.find(".norm") == std::string_view::npos && name.find("norm_") == std::string_view::npos &&
+               !name.starts_with("style_bert_vits2.decoder.ups.");
+    }
     return false;
 }
 
