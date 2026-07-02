@@ -203,6 +203,7 @@ struct simple_server_task {
     std::vector<int32_t> style_bert_tone_ids;
     std::vector<int32_t> style_bert_language_ids;
     std::vector<float> style_bert_bert;
+    std::vector<float> style_bert_style_vec;
     std::vector<int32_t> style_bert_jp_bert_input_ids;
     std::vector<float> style_bert_jp_bert_features;
     uint32_t style_bert_jp_bert_hidden_size = 0;
@@ -569,20 +570,39 @@ struct worker {
                 data = new tts_response;
                 style_bert_vits2_alignment_result alignment;
                 std::string error;
-                if (!style_runner->synthesize_front(task->style_bert_phone_ids,
-                                                    task->style_bert_tone_ids,
-                                                    task->style_bert_language_ids,
-                                                    task->style_bert_bert,
-                                                    task->style_bert_speaker_id,
-                                                    task->style_bert_style_id,
-                                                    task->style_bert_style_weight,
-                                                    task->style_bert_sdp_ratio,
-                                                    task->style_bert_length_scale,
-                                                    task->style_bert_noise_scale,
-                                                    task->style_bert_noise_w_scale,
-                                                    *data,
-                                                    alignment,
-                                                    error)) {
+                bool ok = false;
+                if (!task->style_bert_style_vec.empty()) {
+                    ok = style_runner->synthesize_front_with_style_vec(
+                        task->style_bert_phone_ids,
+                        task->style_bert_tone_ids,
+                        task->style_bert_language_ids,
+                        task->style_bert_bert,
+                        task->style_bert_style_vec,
+                        task->style_bert_speaker_id,
+                        task->style_bert_sdp_ratio,
+                        task->style_bert_length_scale,
+                        task->style_bert_noise_scale,
+                        task->style_bert_noise_w_scale,
+                        *data,
+                        alignment,
+                        error);
+                } else {
+                    ok = style_runner->synthesize_front(task->style_bert_phone_ids,
+                                                        task->style_bert_tone_ids,
+                                                        task->style_bert_language_ids,
+                                                        task->style_bert_bert,
+                                                        task->style_bert_speaker_id,
+                                                        task->style_bert_style_id,
+                                                        task->style_bert_style_weight,
+                                                        task->style_bert_sdp_ratio,
+                                                        task->style_bert_length_scale,
+                                                        task->style_bert_noise_scale,
+                                                        task->style_bert_noise_w_scale,
+                                                        *data,
+                                                        alignment,
+                                                        error);
+                }
+                if (!ok) {
                     task->message = error.empty() ? "Style-Bert front synthesis failed." : error;
                     delete data;
                     response_map->push(task);
@@ -1728,6 +1748,19 @@ int main(int argc, const char ** argv) {
             return;
         }
 
+        std::vector<float> style_vec;
+        if (data.contains("style_vec") || data.contains("style_vec_b64")) {
+            if (!json_float_array(data, "style_vec", style_vec, error)) {
+                res_error(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            if (style_vec.size() != 256) {
+                res_error(res, format_error_response(std::format("style_vec must contain 256 floats: got {}.", style_vec.size()),
+                                                     ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+        }
+
         const float sdp_ratio = json_value(data, "sdp_ratio", 0.0f);
 
         std::string mime_type = MIMETYPE_WAV;
@@ -1761,6 +1794,7 @@ int main(int argc, const char ** argv) {
         task->style_bert_tone_ids = std::move(tone_ids);
         task->style_bert_language_ids = std::move(language_ids);
         task->style_bert_bert = std::move(bert);
+        task->style_bert_style_vec = std::move(style_vec);
         task->style_bert_speaker_id = json_value(data, "speaker_id", 0);
         task->style_bert_style_id = json_value(data, "style_id", 0);
         task->style_bert_style_weight = json_value(data, "style_weight", 1.0f);
